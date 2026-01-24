@@ -1,4 +1,3 @@
-utils::Logger::info("╔════════════════════════════════════════╗");
 #pragma once
 
 // ThreadPool.hpp - Worker thread pool for concurrent connections
