@@ -309,7 +309,9 @@ private:
 
         // Compress karn da faida hai?
         // (Is it worth compressing?)
-        std::string contentType = request.getHeader(http::HttpConstants::HEADER_CONTENT_TYPE);
+        // Response da Content-Type check karo (request da nahi!)
+        // (Check response's Content-Type, not request's!)
+        std::string contentType = response.getHeader(http::HttpConstants::HEADER_CONTENT_TYPE);
         if (contentType.empty()) {
             contentType = http::HttpConstants::MIME_TEXT_PLAIN;
         }

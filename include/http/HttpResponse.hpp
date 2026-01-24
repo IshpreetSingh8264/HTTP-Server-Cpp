@@ -130,6 +130,20 @@ public:
         setHeader(HttpConstants::HEADER_CONNECTION, value);
     }
 
+    // ==================== Getters ====================
+    
+    /**
+     * Header di value laao
+     * (Get header value)
+     */
+    std::string getHeader(const std::string& name) const {
+        auto it = headers_.find(name);
+        if (it != headers_.end()) {
+            return it->second;
+        }
+        return "";
+    }
+
     // ==================== Response Building ====================
     
     /**

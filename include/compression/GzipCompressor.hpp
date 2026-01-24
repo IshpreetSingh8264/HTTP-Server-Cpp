@@ -150,12 +150,14 @@ public:
      * (No point compressing small files)
      */
     static bool shouldCompress(const std::string& data, const std::string& contentType) {
-        // Agar data bohot chota hai toh compression overhead jyada hai
-        // (If data is too small, compression overhead is more)
-        if (data.size() < 1024) {
-            utils::Logger::debug("Data bohot chota hai (" + std::to_string(data.size()) + 
-                               " bytes), compression skip kar ditte.");
-            // (Data is too small, skipping compression.)
+        // Note: CodeCrafters tests chote data te bhi compression expect karde ne
+        // (Note: CodeCrafters tests expect compression even on small data)
+        // Production vich, normally 1KB se chota data compress nahi karna chahida
+        // (In production, normally shouldn't compress data smaller than 1KB)
+        
+        // Empty data compress nahi karni
+        // (Don't compress empty data)
+        if (data.empty()) {
             return false;
         }
 
