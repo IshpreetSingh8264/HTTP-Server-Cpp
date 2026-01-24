@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <string_view>
+#include <sstream>
 
 namespace utils {
 
