@@ -1,62 +1,138 @@
+// main.cpp - HTTP Server Entry Point
+// Yahan se sab shuru hunda hai!
+// (Everything starts from here!)
+
 #include <iostream>
 #include <cstdlib>
 #include <string>
-#include <cstring>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include <csignal>
+#include "server/Server.hpp"
+#include "utils/Logger.hpp"
 
-int main(int argc, char **argv) {
-  // Flush after every std::cout / std::cerr
+// Global server instance - signal handling lai
+// (Global server instance - for signal handling)
+server::Server* globalServer = nullptr;
+
+/**
+ * Signal handler - Ctrl+C te graceful shutdown
+ * (Signal handler - Graceful shutdown on Ctrl+C)
+ */
+void signalHandler(int signal) {
+  if (signal == SIGINT || signal == SIGTERM) {
+    utils::Logger::info("");
+    utils::Logger::info("╔════════════════════════════════════════╗");
+    utils::Logger::info("║  Shutdown signal mili! Band kar rahe  ║");
+    utils::Logger::info("║  (Shutdown signal received! Stopping) ║");
+    utils::Logger::info("╚════════════════════════════════════════╝");
+    
+    if (globalServer) {
+      globalServer->stop();
+    }
+    exit(0);
+  }
+}
+
+/**
+ * Command line arguments parse karo
+ * (Parse command line arguments)
+ * 
+ * Supported:
+ * --directory <path>  : Base directory for file serving
+ */
+std::string parseDirectoryArg(int argc, char** argv) {
+  std::string directory = ".";  // Default current directory
+  
+  // Arguments check karo
+  // (Check arguments)
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    
+    if (arg == "--directory" && i + 1 < argc) {
+      // Next argument directory path hai
+      // (Next argument is directory path)
+      directory = argv[i + 1];
+      utils::Logger::info("File directory argument mili: " + directory);
+      // (File directory argument received)
+      break;
+    }
+  }
+  
+  return directory;
+}
+
+/**
+ * Main function - Server start karo!
+ * (Main function - Start the server!)
+ */
+int main(int argc, char** argv) {
+  // Output buffering off karo - logs turant dikhen
+  // (Turn off output buffering - logs appear immediately)
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
   
-  // You can use print statements as follows for debugging, they'll be visible when running tests.
-  std::cout << "Logs from your program will appear here!\n";
+  utils::Logger::info("");
+  utils::Logger::info("╔═══════════════════════════════════════════════════╗");
+  utils::Logger::info("║                                                   ║");
+  utils::Logger::info("║     🍛 HTTP Dhaba Server - Pinglish Edition 🍛    ║");
+  utils::Logger::info("║        (HTTP Restaurant Server - Pinglish)        ║");
+  utils::Logger::info("║                                                   ║");
+  utils::Logger::info("║  Sat Sri Akaal! Server shuru kar rahe haan!      ║");
+  utils::Logger::info("║  (Hello! Starting the server!)                   ║");
+  utils::Logger::info("║                                                   ║");
+  utils::Logger::info("╚═══════════════════════════════════════════════════╝");
+  utils::Logger::info("");
 
-  // TODO: Uncomment the code below to pass the first stage
+  // Command line arguments parse karo
+  // (Parse command line arguments)
+  std::string fileDirectory = parseDirectoryArg(argc, argv);
   
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd < 0) {
-   std::cerr << "Failed to create server socket\n";
-   return 1;
-  }
+  // Signal handlers setup - graceful shutdown lai
+  // (Setup signal handlers - for graceful shutdown)
+  std::signal(SIGINT, signalHandler);
+  std::signal(SIGTERM, signalHandler);
   
-  // Since the tester restarts your program quite often, setting SO_REUSEADDR
-  // ensures that we don't run into 'Address already in use' errors
-  int reuse = 1;
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-    std::cerr << "setsockopt failed\n";
+  utils::Logger::info("Signal handlers set ho gaye (Ctrl+C lai)");
+  // (Signal handlers set for Ctrl+C)
+
+  try {
+    // Server create karo te start karo!
+    // (Create and start server!)
+    server::Server httpServer(4221, fileDirectory);
+    globalServer = &httpServer;
+    
+    utils::Logger::info("");
+    utils::Logger::info("⚡ Server start ho raha hai... ⚡");
+    utils::Logger::info("⚡ (Server starting...) ⚡");
+    utils::Logger::info("");
+    
+    // Server chalao - yeh blocking call hai
+    // (Run server - this is a blocking call)
+    httpServer.start();
+    
+  } catch (const std::exception& e) {
+    utils::Logger::error("");
+    utils::Logger::error("╔═══════════════════════════════════════════╗");
+    utils::Logger::error("║  Oye! Server crash ho gaya! Exception:   ║");
+    utils::Logger::error("║  (Server crashed! Exception occurred!)   ║");
+    utils::Logger::error("╚═══════════════════════════════════════════╝");
+    utils::Logger::error(std::string(e.what()));
+    return 1;
+    
+  } catch (...) {
+    utils::Logger::error("");
+    utils::Logger::error("╔═══════════════════════════════════════════╗");
+    utils::Logger::error("║  Unknown exception! Kuch taan gadbad!    ║");
+    utils::Logger::error("║  (Unknown exception! Something's wrong!) ║");
+    utils::Logger::error("╚═══════════════════════════════════════════╝");
     return 1;
   }
-  
-  struct sockaddr_in server_addr;
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(4221);
-  
-  if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
-    std::cerr << "Failed to bind to port 4221\n";
-    return 1;
-  }
-  
-  int connection_backlog = 5;
-  if (listen(server_fd, connection_backlog) != 0) {
-    std::cerr << "listen failed\n";
-    return 1;
-  }
-  
-  struct sockaddr_in client_addr;
-  int client_addr_len = sizeof(client_addr);
-  
-  std::cout << "Waiting for a client to connect...\n";
-  
-  accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-  std::cout << "Client connected\n";
-  
-  close(server_fd);
+
+  utils::Logger::info("");
+  utils::Logger::info("╔═══════════════════════════════════════════╗");
+  utils::Logger::info("║  Server band ho gaya. Phir milange!      ║");
+  utils::Logger::info("║  (Server stopped. See you again!)        ║");
+  utils::Logger::info("╚═══════════════════════════════════════════╝");
+  utils::Logger::info("");
 
   return 0;
 }
