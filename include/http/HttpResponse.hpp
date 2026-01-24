@@ -5,6 +5,7 @@
 // (Need to send response to client - format must be correct!)
 
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <sstream>
 #include "http/HttpConstants.hpp"
