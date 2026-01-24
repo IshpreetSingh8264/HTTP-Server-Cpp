@@ -41,9 +41,9 @@ private:
     int port_;                                      // Server port
     std::string fileDirectory_;                     // Base directory for files
     
-    std::unique_ptr<ThreadPool> threadPool_;        // Worker thread pool
-    std::shared_ptr<FileHandler> fileHandler_;      // File operations
-    std::shared_ptr<RouteHandler> routeHandler_;    // Request routing
+    std::unique_ptr<ThreadPool> threadPool_;                // Worker thread pool
+    std::shared_ptr<handlers::FileHandler> fileHandler_;     // File operations
+    std::shared_ptr<handlers::RouteHandler> routeHandler_;   // Request routing
     
     std::atomic<bool> running_;                     // Server running flag
     
@@ -73,10 +73,10 @@ public:
         // (Starting server setup...)
         
         // File handler setup
-        fileHandler_ = std::make_shared<FileHandler>(fileDirectory_);
+        fileHandler_ = std::make_shared<handlers::FileHandler>(fileDirectory_);
         
         // Route handler setup
-        routeHandler_ = std::make_shared<RouteHandler>(fileHandler_);
+        routeHandler_ = std::make_shared<handlers::RouteHandler>(fileHandler_);
         
         // Thread pool setup - hardware_concurrency() workers
         threadPool_ = std::make_unique<ThreadPool>();

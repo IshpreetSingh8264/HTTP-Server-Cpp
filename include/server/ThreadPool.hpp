@@ -1,3 +1,4 @@
+utils::Logger::info("╔════════════════════════════════════════╗");
 #pragma once
 
 // ThreadPool.hpp - Worker thread pool for concurrent connections
@@ -38,7 +39,7 @@ private:
     std::vector<std::thread> workers_;              // Worker threads
     std::queue<std::function<void()>> tasks_;       // Task queue
     
-    std::mutex queueMutex_;                         // Protect task queue
+    mutable std::mutex queueMutex_;                 // Protect task queue (mutable for const methods)
     std::condition_variable condition_;             // Signal workers
     std::atomic<bool> stop_;                        // Shutdown flag
     
