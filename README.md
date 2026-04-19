@@ -1,421 +1,292 @@
-# 🍛 HTTP Dhaba Server - Pinglish Edition
+# HTTP Server — C++
 
-[![progress-banner](https://backend.codecrafters.io/progress/http-server/445bc82a-2d71-49fc-afc5-a57e2f6e1f24)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+An HTTP/1.1 server in C++23, built for the
+[CodeCrafters "Build your own HTTP server" challenge](https://codecrafters.io/challenges/http-server).
 
-> **Sat Sri Akaal!** An HTTP/1.1 server built from scratch in C++23 — raw BSD
-> sockets, a thread pool, and zlib — with humor, love, and lots of Pinglish
-> comments!
+Nine routes, a fixed worker pool, persistent connections, pipelining, and gzip plus deflate with real
+`Accept-Encoding` negotiation. Raw POSIX sockets, no HTTP framework.
 
-This is a solution to the ["Build Your Own HTTP server" Challenge](https://app.codecrafters.io/courses/http-server/overview) from CodeCrafters. **All 14 stages pass** (verified with `codecrafters test`; see [Verification](#-verification) below).
+> **Scope note.** HTTP/1.1 over plain TCP, IPv4 only, no TLS. Chunked request bodies, `Range`, redirects, and
+> HTTP/2 are not implemented — see [Not implemented](#not-implemented).
 
-## 🌟 Features
+## Contents
 
-### Course stages ✅
+- [Quick start](#quick-start)
+- [Routes](#routes)
+- [Architecture](#architecture)
+- [Concurrency](#concurrency)
+- [Request framing](#request-framing)
+- [Compression](#compression)
+- [File serving](#file-serving)
+- [Tests](#tests)
+- [Not implemented](#not-implemented)
+- [Project layout](#project-layout)
 
-All 14 CodeCrafters stages, verified passing:
+## Quick start
 
-| # | Stage | Slug |
-|---|---|---|
-| 1 | Bind to a port | `at4` |
-| 2 | Respond with 200 | `ia4` |
-| 3 | Extract URL path | `ih0` |
-| 4 | Respond with body | `cn2` |
-| 5 | Read header | `fs3` |
-| 6 | Concurrent connections | `ej5` |
-| 7 | Return a file | `ap6` |
-| 8 | Read request body | `qv8` |
-| 9 | Compression headers | `df4` |
-| 10 | Multiple compression schemes | `ij8` |
-| 11 | Gzip compression | `cr8` |
-| 12 | Persistent connections | `ag9` |
-| 13 | Concurrent persistent connections | `ul1` |
-| 14 | Connection closure | `kh7` |
-
-### Beyond the course ✅
-
-- ✅ **gzip *and* raw deflate** — both produced, negotiated per `Accept-Encoding`
-- ✅ **Content-coding negotiation** — `q` weights, `q=0` rejection, `*` wildcard, client order on ties
-- ✅ **Persistent connections** — HTTP/1.1 keep-alive with a 30 s idle timeout
-- ✅ **HTTP pipelining** — several requests in one TCP segment are framed correctly
-- ✅ **HEAD** — real headers-only responses, including the `Content-Length` a GET would have sent
-- ✅ **405 Method Not Allowed** — a known path with the wrong method is not a 400
-- ✅ **Path traversal protection** — every path canonicalised into the served directory
-- ✅ **Strict `Content-Length` parsing** — `-5`, `abc` and out-of-range values are rejected with a 400
-- ✅ **Request size cap** — 1 MB
-- ✅ **Signal handling** — clean shutdown on `SIGINT`/`SIGTERM`
-- ✅ **Quiet by default** — logs to stderr at `ERROR`; `--verbose` for development
-
-### Not implemented, on purpose
-
-TLS, Range requests / 206, and `multipart/form-data` were **removed from the
-CodeCrafters curriculum** and are deliberately absent. `Transfer-Encoding:
-chunked` is also unsupported: request bodies must use `Content-Length`.
-
-## 🏗️ Architecture
-
-```
-┌─────────────┐
-│   Client    │
-└──────┬──────┘
-       │ HTTP Request
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  server::Server   listen/accept, owns the component graph    │
-└──────┬───────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  server::ThreadPool   one task per accepted connection       │
-└──────┬───────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  handlers::ConnectionHandler                                 │
-│  • reads exactly ONE request, keeps the rest buffered         │
-│  • keep-alive loop · 30s timeout · 1MB cap                    │
-└──────┬───────────────────────────────────────────────────────┘
-       │  http::HttpRequest
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  handlers::RouteHandler   thin dispatcher                    │
-└──────┬───────────────────────────────────────────────────────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────────┐
-│  handlers::routes   THE ROUTE TABLE (data, not control flow) │
-│    GET    /                 root_route.cpp                   │
-│    GET    /echo/{str}       echo_route.cpp                   │
-│    GET    /user-agent       user_agent_route.cpp             │
-│    GET    /files/{name...}  files_route.cpp                  │
-│    POST   /files/{name...}  files_route.cpp                  │
-│    HEAD   <each GET>        head_adapter.cpp                 │
-│  └── no method match → 405 · no path match → 404              │
-└──────┬──────────────────────────────┬────────────────────────┘
-       │                              │
-       ▼                              ▼
-┌────────────────────────┐  ┌──────────────────────────────┐
-│ compression::          │  │ handlers::FileHandler        │
-│  EncodingNegotiator   │  │  • read / write              │
-│  ResponseEncoder      │  │  • path-traversal sandbox     │
-│  • gzip  (RFC 1952)   │  └──────────────────────────────┘
-│  • deflate (RFC 1951) │
-└────────────────────────┘
-```
-
-`src/main.cpp` is 72 lines: parse two flags, install a signal handler, construct
-`Server`, start. No domain logic.
-
-## 📁 Project Structure
-
-Headers live next to their translation units under `src/`, so `src` is the
-include root and `#include "http/HttpRequest.hpp"` resolves from anywhere.
-
-```
-codecrafters-http-server-cpp/
-├── .github/
-│   └── copilot-instructions.md  # architecture doc — start here
-├── docs/
-│   ├── ARCHITECTURE.md          # system design & flow  (see note below)
-│   ├── LEARNING_GUIDE.md        # deep-dive on the concepts
-│   └── API_REFERENCE.md         # class/method docs     (see note below)
-├── src/
-│   ├── main.cpp                 # thin entry point
-│   ├── http/                    # HttpRequest, HttpResponse, HttpConstants
-│   ├── handlers/                # ConnectionHandler, FileHandler, RouteHandler
-│   │   └── routes/              # the route table + one file per endpoint
-│   ├── compression/             # content_encoding, response_encoder, negotiator
-│   ├── server/                  # Server, ThreadPool
-│   └── utils/                   # Logger, StringUtils
-├── CMakeLists.txt
-└── vcpkg.json                   # pthreads, zlib
-```
-
-Every header has a matching `.cpp`; there are no header-only classes and no
-empty translation units. Namespaces map one-to-one onto directories:
-`http`, `server`, `handlers`, `compression`, `utils`.
-
-> **Note on `docs/`** — the prose in those three files is still accurate as
-> teaching material, but their file paths, class names and code excerpts
-> predate the restructure. Treat
-> [`.github/copilot-instructions.md`](.github/copilot-instructions.md) as the
-> authoritative architecture reference.
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- **C++23 compiler** (GCC 11+, Clang 14+)
-- **CMake 3.13+**
-- **vcpkg** (for dependency management)
-- **zlib** (for gzip compression)
-- **pthreads** (for threading)
-
-### Build
+Requires **CMake 3.20+** (C++23 support landed in 3.20), a C++23 compiler, zlib, and Python 3. Python is a hard
+configure-time requirement, not just a test dependency.
 
 ```bash
-# Set up vcpkg (if not already done)
-export VCPKG_ROOT=/path/to/vcpkg
+sudo apt install zlib1g-dev cmake
 
-# Configure with CMake
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
-
-# Build
+cmake -B build -S .
 cmake --build ./build
+./build/http-server
+```
 
-# Or use the provided script
+Or:
+
+```bash
 ./your_program.sh
 ```
 
-### Run
+The port is **fixed at 4221** and cannot be changed — there is no `--port` flag.
 
 ```bash
-# Default: port 4221, files served from the current directory, quiet logging
-./build/http-server
+$ curl -i localhost:4221/
+HTTP/1.1 200 OK
+Connection: keep-alive
+Content-Length: 0
+Content-Type: text/plain
 
-# Serve files from a specific directory
-./build/http-server --directory /path/to/files
-
-# Same, but with DEBUG logging on stderr
-./build/http-server --directory /path/to/files --verbose
+$ curl localhost:4221/echo/hello
+hello
+$ curl -H 'User-Agent: my-client/1.0' localhost:4221/user-agent
+my-client/1.0
+$ curl --data-binary 'contents' localhost:4221/files/note.txt -X POST
+$ curl localhost:4221/files/note.txt
+contents
 ```
 
-### Test with curl
+## Routes
 
-```bash
-# Test root endpoint
-curl http://localhost:4221/
-
-# Test echo endpoint
-curl http://localhost:4221/echo/hello
-
-# Test user-agent
-curl http://localhost:4221/user-agent
-
-# Test file serving
-echo "Hello World" > test.txt
-curl http://localhost:4221/files/test.txt
-
-# Test file upload
-curl -X POST http://localhost:4221/files/newfile.txt -d "File content here"
-
-# Test HEAD (headers only, no body)
-curl -I http://localhost:4221/echo/hello
-
-# Test gzip compression
-curl -H "Accept-Encoding: gzip" --compressed http://localhost:4221/echo/hello
-
-# Test deflate compression
-curl -H "Accept-Encoding: deflate" --compressed http://localhost:4221/echo/hello
-
-# Test content-coding negotiation: the first coding the client lists wins
-curl -sI -H "Accept-Encoding: deflate, gzip" http://localhost:4221/echo/hello | grep -i content-encoding
-#   -> Content-Encoding: deflate
-curl -sI -H "Accept-Encoding: gzip, deflate" http://localhost:4221/echo/hello | grep -i content-encoding
-#   -> Content-Encoding: gzip
-curl -sI -H "Accept-Encoding: gzip;q=0.1, deflate;q=0.9" http://localhost:4221/echo/hello | grep -i content-encoding
-#   -> Content-Encoding: deflate   (higher q wins)
-
-# Test a 405
-curl -i -X PUT http://localhost:4221/echo/hello
-#   -> HTTP/1.1 405 Method Not Allowed
-
-# Test persistent connections
-curl -v http://localhost:4221/ http://localhost:4221/echo/test
-```
-
-## 🎯 Supported HTTP Routes
-
-| Method | Path | Description | Example |
-|--------|------|-------------|---------|
-| GET | `/` | Root endpoint | `curl http://localhost:4221/` |
-| GET | `/echo/{str}` | Echo back the string | `curl http://localhost:4221/echo/hello` |
-| GET | `/user-agent` | Return the `User-Agent` header | `curl http://localhost:4221/user-agent` |
-| GET | `/files/{name}` | Serve a file from the directory | `curl http://localhost:4221/files/test.txt` |
-| POST | `/files/{name}` | Save a file to the directory | `curl -X POST http://localhost:4221/files/new.txt -d "content"` |
-| HEAD | any of the above | Headers only, no body | `curl -I http://localhost:4221/echo/hello` |
-
-Routing is a data table in
-[`src/handlers/routes/route_registry.cpp`](src/handlers/routes/route_registry.cpp).
-Anything else is `404 Not Found`; a known path with an unlisted method is
-`405 Method Not Allowed`. See
-[`.github/copilot-instructions.md`](.github/copilot-instructions.md) for a
-worked "how to add a route" recipe.
-
-## 📚 Documentation
-
-- **[LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md)** - Comprehensive guide covering:
-  - TCP/IP & Socket Programming
-  - HTTP Protocol Internals
-  - Concurrency & Threading
-  - Compression Algorithms
-  - Persistent Connections
-
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - System design:
-  - Module interactions
-  - Request lifecycle
-  - Thread pool design
-  - Error handling
-
-- **[API_REFERENCE.md](docs/API_REFERENCE.md)** - Complete API documentation:
-  - Class descriptions
-  - Method signatures
-  - Usage examples
-
-## 🎨 Pinglish Comments
-
-This project features hilarious **Pinglish** (Punjabi + English) comments throughout:
-
-```cpp
-// Oye! Socket ni baneya, koi problem hai
-// (Hey! Socket didn't create, there's a problem)
-
-// Gzip ne kamaal kar ditta! 
-// (Gzip did wonders!)
-
-// Client aa gaya ji, swaagat hai!
-// (Client arrived, welcome!)
-```
-
-## 🧪 Testing with CodeCrafters
-
-```sh
-codecrafters test        # runs all 14 stages
-git push origin master   # or: codecrafters submit
-```
-
-## ✅ Verification
-
-Every claim on this page was checked by running the thing, not by reading it.
-
-**All 14 CodeCrafters stages pass.** `codecrafters test`, 2026-09-27:
-
-```
-[tester::#KH7] Test passed.   (Connection closure)
-[tester::#UL1] Test passed.   (Concurrent persistent connections)
-[tester::#AG9] Test passed.   (Persistent connections)
-[tester::#CR8] Test passed.   (Gzip compression)
-[tester::#IJ8] Test passed.   (Multiple compression schemes)
-[tester::#DF4] Test passed.   (Compression headers)
-[tester::#QV8] Test passed.   (Read request body)
-[tester::#AP6] Test passed.   (Return a file)
-[tester::#EJ5] Test passed.   (Concurrent connections)
-[tester::#FS3] Test passed.   (Read header)
-[tester::#CN2] Test passed.   (Respond with body)
-[tester::#IH0] Test passed.   (Extract URL path)
-[tester::#IA4] Test passed.   (Respond with 200)
-[tester::#AT4] Test passed.   (Bind to a port)
-Test passed. Congrats!
-```
-
-`ij8` is worth spelling out, because its tester is weaker than the stage name
-suggests. It only asserts that a `Content-Encoding` header is *present* for
-`Accept-Encoding: encoding-1, gzip, encoding-2` and *absent* for
-`Accept-Encoding: encoding-1, encoding-2`. It never checks *which* coding comes
-back, and it never mentions deflate. So the stage passed before deflate
-existed, and it passes now that deflate is really implemented and negotiated.
-
-**Compression, measured** on a 400-byte body, with an independent zlib
-round-trip check:
-
-| Request | Response | Size |
+| Method | Path | Behaviour |
 |---|---|---|
-| *(no `Accept-Encoding`)* | — | 400 |
-| `Accept-Encoding: gzip` | `Content-Encoding: gzip` | 26 |
-| `Accept-Encoding: deflate` | `Content-Encoding: deflate` | 8 |
-| `Accept-Encoding: gzip, deflate` | `Content-Encoding: gzip` | 26 |
-| `Accept-Encoding: deflate, gzip` | `Content-Encoding: deflate` | 8 |
-| `Accept-Encoding: gzip;q=0.1, deflate;q=0.9` | `Content-Encoding: deflate` | 8 |
-| `Accept-Encoding: identity` | *(no header)* | 400 |
-| `Accept-Encoding: br` | *(no header)* | 400 |
+| `GET` | `/` | `200`, empty body, `text/plain`. |
+| `GET` | `/echo/{str}` | `200`, echoes the single path segment verbatim. No URL decoding. |
+| `GET` | `/user-agent` | `200`, the `User-Agent` value, or the literal `Unknown`. |
+| `GET` | `/files/{name...}` | `200` with the file's bytes and a guessed `Content-Type`. |
+| `POST` | `/files/{name...}` | `201` on success. `400` on an empty body. |
+| `HEAD` | `/`, `/echo/{str}`, `/user-agent`, `/files/{name...}` | Same headers as the `GET`, no body. |
 
-Both `gzip -d` and a raw-DEFLATE `zlib.decompressobj(-MAX_WBITS)` recover the
-original bytes, and `curl --compressed` round-trips both.
+`{str}` matches exactly one segment, so `/echo/a/b` is a `404`. `{name...}` is a greedy tail, so `/files/a/b/c.txt`
+works and names `a/b/c.txt`.
 
-**Also verified with curl:** 200/404/405/400-when-malformed status codes,
-`PUT`/`DELETE`/`OPTIONS` → 405, `HEAD` → 200 with `Content-Length: 3` and 0
-body bytes, file upload and read-back, byte-identical binary serving,
-path-traversal rejection, 10 concurrent connections, keep-alive, and four
-pipelining cases (including a 20 KB body that spans three `recv` calls).
+Resolution order: path and method both match → handler; path matches but method does not → `405`; nothing matches →
+`404`.
 
-## 🔧 Configuration
+## Architecture
 
-### Thread Pool Size
-
-Defaults to `std::thread::hardware_concurrency()` workers, minimum 4. To pin
-it, change the construction in
-[Server.cpp](src/server/Server.cpp):
-
-```cpp
-threadPool_ = std::make_unique<ThreadPool>(8);
+```
+  accept()                                    ┌──────────────────────┐
+     │                                        │  routes::dispatch    │
+     ▼                                        │                      │
+ ThreadPool.enqueue(...)                      │  1. pathMatches      │
+     │                                        │  2. handler          │
+     ▼                                        │  3. applyContent     │
+ ┌──────────────────────────────┐              │       Encoding       │
+ │  ConnectionHandler           │──────────────│  4. serialise        │
+ │                              │  Request     └──────────────────────┘
+ │  loop {                      │  Response        │
+ │    readRequest  ── framing ──┤                 │
+ │    dispatch                 │            route table
+ │    sendResponse ── partial ──┘                 │
+ │  }                            │          /  /echo/{str}
+ └──────────────────────────────┘          /  /user-agent
+            │                             /  /files/{name...}
+            ▼                             + 4 HEAD rows
+      FileHandler
+      (sandboxed)
 ```
 
-### Connection Timeout
+| Module | Responsibility |
+|---|---|
+| `server/Server.cpp` | listening socket, accept loop |
+| `server/ThreadPool.cpp` | fixed worker pool |
+| `handlers/ConnectionHandler.cpp` | the per-connection loop, framing, sending |
+| `handlers/routes/route_registry.cpp` | the route table, matching, dispatch, encoding policy |
+| `handlers/FileHandler.cpp` | the only component that touches the filesystem |
+| `compression/` | zlib encode, `Accept-Encoding` negotiation |
+| `http/` | `HttpRequest`, `HttpResponse`, constants |
+| `utils/` | string helpers, logging |
 
-Default **30 seconds** (the HTTP/1.1 recommendation). Change
-`TIMEOUT_SECONDS` in
-[ConnectionHandler.hpp](src/handlers/ConnectionHandler.hpp).
+`RouteHandler` is a two-line forward to `routes::dispatch`. The real work is in the registry.
 
-### Max Request Size
+## Concurrency
 
-Default **1 MB** (`MAX_REQUEST_SIZE`, same file). A larger `Content-Length` is
-rejected with a 400 rather than buffered.
+A fixed pool sized to `hardware_concurrency()`, with a floor of 4. The main thread blocks in `accept()` and hands each
+accepted fd to the pool as a task; the worker runs `handleClient` for the connection's entire lifetime.
 
-### Port Number
+```cpp
+ThreadPool(size_t numThreads = 0);   // 0 → hardware_concurrency(), minimum 4
+void enqueue(Task);                  // drops the task silently if the pool is stopping
+```
 
-Default **4221**, the `DEFAULT_PORT` constant in
-[main.cpp](src/main.cpp).
+Workers execute outside the mutex and catch everything, so one bad request cannot kill a worker. The destructor sets
+the stop flag, notifies everyone, and joins.
 
-## 🛡️ Security Features
+**The ceiling is N connections, not N plus a queue.** A task holds its socket for the whole connection, including every
+keep-alive iteration, and each `recv()` can block for up to 30 seconds. So with four workers, a fifth connection sits
+in the queue and its client sees nothing until a worker frees up. This is a real limit, not a theoretical one.
 
-- **Path Traversal Protection** — every path is canonicalised and rejected
-  unless it resolves inside the served directory. A plain string-prefix check
-  would let `/data/root2` through a `/data/root` base, so the check compares
-  whole path components.
-- **Request Size Limits** — 1 MB, and a `Content-Length` that is negative,
-  non-numeric, or out of range is rejected before a single body byte is read
-- **Timeout Protection** — 30 s read timeout
-- **Safe File Operations** — every file operation goes through the sandbox
+All sockets are blocking. `SO_RCVTIMEO` is set to 30 seconds per connection; `SO_SNDTIMEO` is **not** set, so writing
+to a peer that has stopped reading can block indefinitely. `TCP_NODELAY` is not set either.
 
-## 📚 Documentation
+`SIGPIPE` is handled by passing `MSG_NOSIGNAL` on every `send`, rather than by ignoring the signal globally.
 
-- **[.github/copilot-instructions.md](.github/copilot-instructions.md)** —
-  **the authoritative architecture reference**: component map, data flow,
-  conventions, module map, and a worked "how to add a route" recipe
+## Request framing
 
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — system design: module
-  interactions, request lifecycle, thread pool design, error handling.
-  *Paths and class names predate the restructure; see the note in
-  [Project Structure](#-project-structure).*
+Framing is where HTTP servers usually get subtle, so it is worth spelling out.
+`ConnectionHandler::readRequest`:
 
-- **[LEARNING_GUIDE.md](docs/LEARNING_GUIDE.md)** — the concepts behind it all:
-  TCP/IP and socket programming, HTTP protocol internals, concurrency and
-  threading, compression algorithms, persistent connections. *Same caveat.*
+1. Find `\r\n\r\n` in the persistent read buffer. Everything after it is the body.
+2. Parse a throwaway `HttpRequest` from the buffer just to read `Content-Length`.
+3. Validate it — digits only, no sign, no exponent, `ERANGE` or above the maximum is a failure. A failure is a `400`
+   followed by a close.
+4. If the buffer holds header + `Content-Length` bytes, carve out exactly that many and leave the rest for the next
+   iteration. This is what makes pipelining work.
+5. Otherwise `recv()` into an 8 KiB stack buffer and loop.
 
-- **[API_REFERENCE.md](docs/API_REFERENCE.md)** — class and method walkthroughs.
-  *Same caveat — it still documents the old header-only layout.*
+`parseContentLength` exists because three real bugs shipped through the naive version: a non-numeric value threw out of
+`readRequest` and killed the worker silently, a negative value wrapped to about 1.8 × 10¹⁹ and the server waited forever
+for a body that would never arrive, and an absurd exponent threw `out_of_range`.
 
-## 🤝 Contributing
+Two limits to know about:
 
-This is a learning project, and the Pinglish comments are deliberate. Real
-improvements are very welcome:
+- An oversized *raw* byte stream gets no response at all. The client sees EOF, not a `400`. Only a bad or oversized
+  *declared* `Content-Length` produces a `400`.
+- The effective request ceiling is `MAX_REQUEST_SIZE` (1 MiB) **minus the header bytes**, because the total is checked
+  against the same limit. A `Content-Length` of exactly 1 MiB therefore passes validation and then fails to buffer.
 
-- Keep `main.cpp` thin and routing data-driven — see
-  [copilot-instructions.md](.github/copilot-instructions.md) §6
-- Every header needs a matching `.cpp`, and no file should pass 600 lines
-- Prove non-obvious behaviour with a test, not a comment
-- Fix the `docs/` staleness if you touch the code it describes
+## Compression
 
-## 📝 License
+Both codings are the same DEFLATE; only the container differs.
 
-For educational purposes (the CodeCrafters challenge).
+- `gzip` — RFC 1952 framing, `deflateInit2` with `windowBits = 15 + 16`.
+- `deflate` — **raw** RFC 1951, `windowBits = -15`. RFC 9110 nominally specifies the zlib/RFC 1950 wrapper here, but
+  every browser and curl expect the raw stream, so that is what is sent.
 
-## 🙏 Acknowledgments
+**Negotiation** (`EncodingNegotiator`) parses `Accept-Encoding` into preferences with `q` values, skips codings the
+server does not offer, and picks the highest `q`. Ties break on the client's ordering. `q=0` is a refusal. `*` matches
+anything. An empty or whitespace-only header means `Identity` — a server that compresses unasked breaks naive clients.
+A `406` is never returned.
 
-- **CodeCrafters** — for the challenge, and for a public
-  `course-definition.yml` that made the stage list verifiable
-- **Punjabi culture** — for the humour and the warmth
-- **the C++ community** — for the tools and the libraries
+**Policy** is applied in `dispatch`, after the handler returns and before serialisation — not inside the routes, so a
+route never has to think about it. `ResponseEncoder::shouldCompress` skips empty bodies and anything whose content type
+contains `image/`, `video/`, `audio/`, `application/zip`, or `application/gzip`. There is deliberately **no minimum
+size threshold**, because the test harness expects compression even on tiny bodies. A failed zlib call falls back to
+identity rather than failing the request.
 
----
+**Repeated headers are comma-joined.** RFC 9110 §5.3 says a list-valued field that appears more than once is the
+comma-joined union of every occurrence. Without that, this:
 
-**Sat Sri Akaal! Happy coding! 🚀**
+```bash
+curl -H 'Accept-Encoding: deflate' -H 'Accept-Encoding: gzip' ...
+```
+
+would silently lose the `deflate` offer, because the header map is a plain `unordered_map` and last-one-wins is the
+default. So `HttpRequest::parseHeaderLine` appends `", " + value` when a name is already present.
+
+Two caveats worth knowing. The merge keys on the raw, un-normalised name, so identically-cased field names merge but
+differently-cased ones do not. And the merge is unconditional, so a repeated `Content-Length` becomes `"5, 10"` and is
+then correctly rejected as non-numeric — right outcome, accidental mechanism.
+
+## File serving
+
+`FileHandler` is the only component that touches the filesystem, and every path goes through `isPathSafe`:
+
+```cpp
+canonicalBase = std::filesystem::canonical(baseDirectory_);
+canonicalPath = std::filesystem::weakly_canonical(path);
+safe = std::mismatch(base, path) puts baseEnd at canonicalBase.end();
+```
+
+The comparison is **component-wise**, not character-wise, so `/data/root2` is correctly rejected against a base of
+`/data/root`. Any exception during resolution denies the request.
+
+Files are read whole into memory; nothing is streamed. Writes create parent directories, so a nested `POST` works.
+
+| Situation | Status |
+|---|---|
+| `GET`, file exists, non-empty | `200` |
+| `GET`, missing or unsafe path | `404` |
+| `GET`, zero-byte file | `500` |
+| `POST`, empty body | `400` |
+| `POST`, write failed or unsafe path | `500` |
+| `POST`, success | `201` |
+
+The zero-byte `500` is odd but long-standing and called out in the source: you cannot create a zero-byte file with
+`POST` (that is a `400`) and you cannot read one back. A `POST` traversal attempt returns `500` rather than `403`.
+
+## Tests
+
+```bash
+./tests/run.sh                # configure, build, all suites, size budget
+./tests/run.sh unit           # the three C++ binaries
+./tests/run.sh integration    # behavioural suite; needs port 4221 free
+
+cmake -B build -S . && cmake --build build && ctest --test-dir build --output-on-failure
+```
+
+**150 assertions: 73 unit, 77 integration.**
+
+| Suite | Assertions | Covers |
+|---|---|---|
+| `unit/route_matcher_test.cpp` | 12 | path matching, both parameter forms, 404 vs 405 |
+| `unit/negotiation_test.cpp` | 35 | `q` values, case, whitespace, `*`, aliases, malformed input |
+| `unit/string_utils_test.cpp` | 26 | `split` including empty tokens, and the string helpers |
+| `integration/test_routing.py` | 37 | raw sockets: status codes, HEAD, pipelining, `Content-Length` validation |
+| `integration/test_compression.py` | 31 | a 14-row negotiation table plus single-shot encode/decode round trips |
+| `integration/test_pipelining.py` | 9 | POST-then-GET, 20 KB bodies, keep-alive, 10 concurrent connections |
+
+All three unit binaries link `libhttpcore.a`, so they exercise the shipped code rather than a copy. The integration
+suite speaks raw sockets — no curl — and starts the server against a temporary directory, so nothing depends on the
+machine's real filesystem.
+
+`tests/check_size.py` fails if any test file passes 500 lines.
+
+**Not covered**, and stated in `tests/README.md`: TLS, `Range` and `206`, multipart, chunked request bodies, the
+zero-byte-file `500`, response headers other than `Content-Length` and `Content-Encoding`, the thread pool directly,
+slow clients, and load. The repeated-`Accept-Encoding` merge is also untested.
+
+## Not implemented
+
+- **No chunked request bodies.** A `Transfer-Encoding: chunked` body is treated as zero bytes.
+- **No `Vary: Accept-Encoding`.** A caching intermediary can hand a gzipped body to a client that asked for `identity`.
+- **No `Date` or `Server` header**, and no `Allow` header on a `405`.
+- **No redirects.** There is no 3xx status in the constants table.
+- **No `Expect: 100-continue`.**
+- **HTTP/1.0 is parsed but ignored.** The version is stored and never used, so an HTTP/1.0 request with no `Connection`
+  header gets keep-alive.
+- **No TLS, no HTTP/2, no upgrade.**
+- **The port cannot be changed**, and the bind is IPv4-only.
+- **Shutdown is not graceful.** `stop()` flips a flag and closes the listening socket; in-flight connections are not
+  drained, and the signal handler calls `_exit` directly.
+- **Response header order is unspecified** — headers are emitted from an `unordered_map`.
+- **`HttpResponse::getHeader` is case-sensitive** while `HttpRequest::getHeader` is not. It works today only because
+  every call site uses the same constants.
+
+## Project layout
+
+```
+src/
+  main.cpp                  argument parsing, signal handlers
+  server/                   Server, ThreadPool
+  handlers/                 ConnectionHandler, RouteHandler, FileHandler
+  handlers/routes/          the route table and one file per route
+  compression/              zlib encoding and Accept-Encoding negotiation
+  http/                     HttpRequest, HttpResponse, HttpConstants
+  utils/                    StringUtils, Logger
+tests/
+  unit/                     three C++ suites
+  integration/              three Python suites and a shared harness
+  run.sh, check_size.py
+```
+
+`CMakeLists.txt` puts everything except `main.cpp` into `libhttpcore.a`, so the unit tests link the shipped code.
+`src` is the include root, hence role-based includes like `#include "http/HttpRequest.hpp"`.
+
+## Licence
+
+No licence file is present in this repository. Add one before redistributing.

@@ -1,703 +1,197 @@
-# 🏗️ HTTP Server Architecture
+# HTTP Server — Architecture
 
-> **System design te data flow - sab kuch organized!**
->
-> (System design and data flow - everything organized!)
+How the server is put together. The [README](../README.md) covers what it does; this covers the shape of the code.
 
-This document describes the architecture, module interactions, and design patterns used in the HTTP Dhaba Server.
+> This file replaces `docs/API_REFERENCE.md` and `docs/LEARNING_GUIDE.md`. The API reference documented a different
+> codebase: it gave `FileHandler::readFile` a `std::string` return and said it throws, when it returns a
+> `std::vector<char>` and never throws; it gave `ConnectionHandler` a `handleClient(int)` method and no socket in its
+> constructor, when it has `handleConnection()` and takes the fd; and it described `Server::stop()` as waiting for
+> active connections, which it does not do.
 
----
+## Contents
 
-## Table of Contents
+- [Layering](#layering)
+- [The route table](#the-route-table)
+- [Path matching](#path-matching)
+- [Connection lifecycle](#connection-lifecycle)
+- [Content encoding as a policy](#content-encoding-as-a-policy)
+- [The file sandbox](#the-file-sandbox)
+- [Header storage](#header-storage)
+- [Adding a route](#adding-a-route)
+- [File map](#file-map)
+- [Conventions](#conventions)
 
-1. [System Overview](#system-overview)
-2. [Module Architecture](#module-architecture)
-3. [Request Lifecycle](#request-lifecycle)
-4. [Thread Pool Design](#thread-pool-design)
-5. [Error Handling Strategy](#error-handling-strategy)
-6. [Design Patterns](#design-patterns)
-
----
-
-## System Overview
-
-### High-Level Architecture
+## Layering
 
 ```
-┌──────────────────── HTTP Dhaba Server ────────────────────┐
-│                                                            │
-│  ┌─────────────────── Entry Point ────────────────────┐   │
-│  │  main.cpp                                          │   │
-│  │  • Parse command-line args (--directory)           │   │
-│  │  • Setup signal handlers (Ctrl+C)                  │   │
-│  │  • Create Server instance                          │   │
-│  └──────────────────────┬─────────────────────────────┘   │
-│                         │                                  │
-│  ┌──────────────────────▼──────────────────────────────┐  │
-│  │  Server (Orchestrator)                              │  │
-│  │  • Socket management (create, bind, listen)         │  │
-│  │  • Accept loop (main thread)                        │  │
-│  │  • Dispatch connections to ThreadPool               │  │
-│  │  • Graceful shutdown                                │  │
-│  └──────────┬─────────────────────────┬────────────────┘  │
-│             │                         │                    │
-│     ┌───────▼────────┐       ┌────────▼────────┐          │
-│     │  ThreadPool    │       │  RouteHandler   │          │
-│     │  • N workers   │       │  • URL routing  │          │
-│     │  • Task queue  │       │  • Compression  │          │
-│     │  • Concurrency │       │  • Responses    │          │
-│     └───────┬────────┘       └────────┬────────┘          │
-│             │                         │                    │
-│     ┌───────▼─────────────────────────▼────────┐          │
-│     │  ConnectionHandler                       │          │
-│     │  • Read HTTP request                     │          │
-│     │  • Persistent connection loop            │          │
-│     │  • Timeout management                    │          │
-│     │  • Send HTTP response                    │          │
-│     └──────────────────┬───────────────────────┘          │
-│                        │                                   │
-│         ┌──────────────┴────────────────┐                 │
-│         │                               │                 │
-│    ┌────▼─────────┐            ┌────────▼──────────┐     │
-│    │ FileHandler  │            │  compression::    │     │
-│    │ • Read files │            │   Negotiator      │     │
-│    │ • Write files│            │   • parse A-E     │     │
-│    │ • Path safety│            │   • pick coding   │     │
-│    │              │            │  Encoder          │     │
-│    │              │            │   • gzip / deflate│     │
-│    └──────────────┘            └───────────────────┘     │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
+main.cpp
+  └── server/Server                 listening socket, accept loop
+        └── server/ThreadPool       fixed worker pool
+              └── handlers/ConnectionHandler    the per-connection loop
+                    ├── handlers/RouteHandler   a forward to routes::dispatch
+                    │     └── handlers/routes/  the table, matching, dispatch, encoding
+                    │           └── handlers/FileHandler
+                    ├── compression/            zlib + negotiation
+                    ├── http/                   HttpRequest, HttpResponse
+                    └── utils/                  StringUtils, Logger
 ```
 
-### Layer Responsibilities
+Each layer knows only the one below it. `ConnectionHandler` does not know which routes exist; the registry does not know
+about sockets; `FileHandler` knows nothing about HTTP.
 
-| Layer | Responsibility | Key Classes |
-|-------|----------------|-------------|
-| **Entry** | Application startup, config | `main.cpp` |
-| **Server** | Socket lifecycle, orchestration | `Server`, `ThreadPool` |
-| **Handler** | Request framing, routing, file IO | `ConnectionHandler`, `RouteHandler`, `FileHandler` |
-| **Protocol** | HTTP parsing & building | `HttpRequest`, `HttpResponse`, `HttpConstants` |
-| **Compression** | Coding negotiation and encoding | `EncodingNegotiator`, `ResponseEncoder`, `ContentEncoding` |
-| **Utilities** | Cross-cutting concerns | `Logger`, `StringUtils` |
+`CMakeLists.txt` compiles everything except `main.cpp` into `libhttpcore.a`, so the unit tests link the same objects the
+server does.
 
----
-
-## Module Architecture
-
-### 1. Server Module (`src/server/`)
-
-**Purpose:**
-> Server de core functionality - socket setup te connection management
->
-> (Server's core functionality - socket setup and connection management)
-
-**Components:**
-
-#### Server Class
-- **Responsibility:** Main orchestrator
-- **Lifecycle:**
-  1. Create socket (`socket()`)
-  2. Set options (`setsockopt()`)
-  3. Bind to port (`bind()`)
-  4. Listen (`listen()`)
-  5. Accept loop (`accept()`)
-  6. Dispatch to ThreadPool
-  7. Graceful shutdown
-
-**State Machine:**
-```
-   INIT
-     │
-     ▼
-  CREATED ──socket()──> BOUND ──listen()──> LISTENING ──accept()──> RUNNING
-     │         │          │                      │
-     └─error───┴──────────┴──────────────────────┴─────────> STOPPED
-```
-
-#### ThreadPool Class
-- **Responsibility:** Manage worker threads
-- **Architecture:** Producer-Consumer pattern
-  - **Producer:** Server's accept loop (adds tasks)
-  - **Consumer:** Worker threads (execute tasks)
-  - **Queue:** `std::queue<std::function<void()>>`
-  - **Synchronization:** `std::mutex` + `std::condition_variable`
-
-**Data Flow:**
-```
-accept() → enqueue(task) → notify_one() → worker picks task → execute
-```
-
-**Implementation:** [Server.hpp](../src/server/Server.hpp), [ThreadPool.hpp](../src/server/ThreadPool.hpp)
-
----
-
-### 2. Handler Module (`src/handlers/`)
-
-**Purpose:**
-> Requests nu handle karo - connection se lekar response tak
->
-> (Handle requests - from connection to response)
-
-**Components:**
-
-#### ConnectionHandler
-- **Responsibility:** Socket I/O, persistent connections
-- **Flow:**
-  ```
-  1. Set socket timeout (30s)
-  2. Loop while keep-alive:
-     a. Read request (recv())
-     b. Parse request
-     c. Route to handler
-     d. Send response (send())
-     e. Check Connection header
-  3. Close socket
-  ```
-
-**Persistent Connection Logic:**
-```cpp
-bool keep_alive = true;
-while (keep_alive) {
-    request = read_request();
-    response = route_handler->handle(request);
-    
-    // Check if client wants to close
-    if (request.getHeader("Connection") == "close") {
-        keep_alive = false;
-        response.setHeader("Connection", "close");
-    }
-    
-    send_response(response);
-}
-```
-
-#### RouteHandler
-- **Responsibility:** thin dispatcher. It holds the `FileHandler` and hands the
-  request to the route table in `handlers/routes/`. It contains no routing
-  logic of its own.
-- **Routes** (the table lives in [route_registry.cpp](../src/handlers/routes/route_registry.cpp)):
-
-  | Pattern | Handler | File |
-  |---------|---------|------|
-  | `GET /` | `handleRoot()` | `root_route.cpp` |
-  | `GET /echo/{str}` | `handleEcho()` | `echo_route.cpp` |
-  | `GET /user-agent` | `handleUserAgent()` | `user_agent_route.cpp` |
-  | `GET /files/{name...}` | `handleFileGet()` | `files_route.cpp` |
-  | `POST /files/{name...}` | `handleFilePost()` | `files_route.cpp` |
-  | `HEAD` on each of the above | `asHead(<getHandler>)` | `head_adapter.cpp` |
-
-  Compression is no longer a per-route decision. The dispatcher applies the
-  content-coding policy to whatever the handler returned, so a route cannot
-  forget to compress and a new route gets compression for free.
-
-**Routing algorithm:** iterate the table, match the pattern, compare the
-method.
-```cpp
-for (const Route& route : routeTable()) {
-    if (!pathMatches(path, route.pathPattern)) continue;
-    pathMatchedSomeRoute = true;
-    if (method == route.method) return route.handler(ctx);
-}
-return pathMatchedSomeRoute ? methodNotAllowed() : notFound();
-```
-
-Pattern syntax: `{name}` matches exactly one path segment, `{name...}` is a
-greedy tail that matches the rest. A known path with an unlisted method is
-**405**, not 400; an unknown path is **404**.
-
-#### FileHandler
-- **Responsibility:** File I/O, security
-- **Security Features:**
-  - Path traversal protection (canonical paths)
-  - Base directory enforcement
-  - Read/write validation
-
-**Path Safety:**
-```cpp
-canonical_base = canonical(baseDirectory)
-canonical_path = weakly_canonical(baseDirectory / requested)
-
-// Compare whole path COMPONENTS, not characters: a character-prefix check
-// would accept "/var/wwwroot" for a base of "/var/www".
-mismatch(base.begin(), base.end(), path.begin(), path.end());
-if (base_iter == base.end()) → SAFE
-else → REJECT (path traversal)
-```
-
-**Implementation:** [ConnectionHandler.hpp](../src/handlers/ConnectionHandler.hpp), [RouteHandler.hpp](../src/handlers/RouteHandler.hpp), [FileHandler.hpp](../src/handlers/FileHandler.hpp)
-
----
-
-### 3. HTTP Module (`src/http/`)
-
-**Purpose:**
-> HTTP protocol lai - parsing te building
->
-> (For HTTP protocol - parsing and building)
-
-**Components:**
-
-#### HttpRequest
-- **Parsing Pipeline:**
-  ```
-  Raw string → Split by "\r\n\r\n" → Headers + Body
-                    │
-                    ├─> Request line → Method, Path, Version
-                    └─> Header lines → Map<Name, Value>
-  ```
-
-**State Diagram:**
-```
-  EMPTY
-    │
-    ├─parse()─> PARSING ─success─> VALID
-    │               │
-    │               └─fail─> INVALID
-    │
-    └─isValid()─> VALID / INVALID
-```
-
-#### HttpResponse
-- **Building Pipeline:**
-  ```
-  Status Code → Status Line
-      ↓
-  Headers → Add headers
-      ↓
-  Body → Calculate Content-Length
-      ↓
-  toString() → Complete HTTP response
-  ```
-
-**Factory Methods:**
-- `ok(body)` → 200 OK
-- `created()` → 201 Created
-- `notFound()` → 404 Not Found
-- `internalError()` → 500 Error
-
-#### HttpConstants
-- **Centralized Constants:**
-  - Status codes + text
-  - Header names
-  - MIME types
-  - Protocol strings
-
-**Implementation:** [HttpRequest.hpp](../src/http/HttpRequest.hpp), [HttpResponse.hpp](../src/http/HttpResponse.hpp), [HttpConstants.hpp](../src/http/HttpConstants.hpp)
-
----
-
-### 4. Compression Module (`src/compression/`)
-
-**Purpose:**
-> Data compression lai bandwidth bachana
->
-> (For data compression to save bandwidth)
-
-**Components:**
-
-Three classes, one per concept. Before the restructure this was a single
-`GzipCompressor` that only ever produced gzip, despite a `deflate` constant
-sitting unused in `HttpConstants`.
-
-| Class | Responsibility |
-|---|---|
-| `ContentEncoding` | the codings we can emit (`Gzip`, `Deflate`, `Identity`) |
-| `ResponseEncoder` | zlib deflate, container chosen by coding |
-| `EncodingNegotiator` | `Accept-Encoding` -> one chosen coding |
-
-**Encoding Pipeline:**
-```
-Negotiation:  Accept-Encoding -> parse -> score each coding -> pick one
-                                                ↓
-Encoder:       deflateInit2(windowBits)  →  deflate(Z_FINISH)  →  deflateEnd()
-                 15 + 16 = gzip container
-                 -15     = raw deflate stream
-```
-
-Both codings are the same DEFLATE algorithm; only the container differs. On a
-400-byte body gzip costs 26 bytes and deflate costs 8 — the 18-byte difference
-is exactly the gzip header and trailer.
-
-**Decision Tree:**
-```
-Accept-Encoding present?
-  ├─No──> Identity (no compression)
-  └─Yes─> score every coding we can produce:
-            highest q wins;  coding;q=0 is refused
-            on a q tie, the client's list order wins
-            "*" accepts anything we can produce
-              ↓
-          Content-Type already compressed (image/video/audio/zip)?
-            ├─Yes──> Identity
-            └─No───> compress with the chosen coding
-```
-
-**Implementation:** [content_encoding.hpp](../src/compression/content_encoding.hpp),
-[response_encoder.hpp](../src/compression/response_encoder.hpp),
-[encoding_negotiator.hpp](../src/compression/encoding_negotiator.hpp)
-
----
-
-### 5. Utilities Module (`src/utils/`)
-
-**Purpose:**
-> Cross-cutting concerns - logging, string operations
->
-> (Common utilities across all modules)
-
-**Components:**
-
-#### Logger
-- **Thread-Safe Logging:**
-  ```
-  log() → lock_guard<mutex> → colorize → output → unlock
-  ```
-
-- **Log Levels:**
-  - DEBUG (Cyan) - Detailed info
-  - INFO (Green) - Normal operations
-  - WARN (Yellow) - Warnings
-  - ERROR (Red) - Errors
-
-#### StringUtils
-- **Utilities:**
-  - `split()` - Split strings
-  - `trim()` - Remove whitespace
-  - `toLower()` - Lowercase conversion
-  - `equalsIgnoreCase()` - Case-insensitive compare
-  - `urlDecode()` - URL decoding
-
-**Implementation:** [Logger.hpp](../src/utils/Logger.hpp), [StringUtils.hpp](../src/utils/StringUtils.hpp)
-
----
-
-## Request Lifecycle
-
-### Complete Flow Diagram
-
-```
-Client                    Server                  ThreadPool              ConnectionHandler         RouteHandler          FileHandler
-  │                         │                         │                          │                        │                    │
-  ├─TCP Connect────────────>│                         │                          │                        │                    │
-  │                         ├─accept()                │                          │                        │                    │
-  │                         ├─enqueue(task)──────────>│                          │                        │                    │
-  │                         │                         ├─worker picks task        │                        │                    │
-  │                         │                         ├─execute()───────────────>│                        │                    │
-  │                         │                         │                          ├─setSocketTimeout()     │                    │
-  ├─HTTP Request───────────────────────────────────────────────────────────────>│                        │                    │
-  │                         │                         │                          ├─readRequest()          │                    │
-  │                         │                         │                          ├─parse()                │                    │
-  │                         │                         │                          ├─handleRequest()───────>│                    │
-  │                         │                         │                          │                        ├─route matching     │
-  │                         │                         │                          │                        ├─handleFileGet()───>│
-  │                         │                         │                          │                        │                    ├─readFile()
-  │                         │                         │                          │                        │<───file data───────┤
-  │                         │                         │                          │                        ├─applyCompression() │
-  │                         │                         │                          │<───HttpResponse────────┤                    │
-  │                         │                         │                          ├─sendResponse()         │                    │
-  │<─HTTP Response───────────────────────────────────────────────────────────────┤                        │                    │
-  │                         │                         │                          ├─check Connection       │                    │
-  │                         │                         │                          ├─keep-alive? Loop      │                    │
-  │                         │                         │                          │   OR                   │                    │
-  │                         │                         │                          ├─close? End            │                    │
-  ├─TCP Close──────────────────────────────────────────────────────────────────>│                        │                    │
-  │                         │                         │                          ├─closeConnection()      │                    │
-```
-
-### Step-by-Step Breakdown
-
-1. **Connection Acceptance** (Server)
-   - `accept()` blocks waiting for client
-   - Returns client socket FD
-   - Enqueues task to ThreadPool
-
-2. **Task Dispatch** (ThreadPool)
-   - Worker thread picks task from queue
-   - Executes `handleClient(socket)`
-
-3. **Request Reading** (ConnectionHandler)
-   - Sets 30s timeout
-   - Reads until `\r\n\r\n` found
-   - Reads body if `Content-Length` present
-
-4. **Request Parsing** (HttpRequest)
-   - Splits request line
-   - Parses headers into map
-   - Validates format
-
-5. **Routing** (RouteHandler)
-   - Matches URL pattern
-   - Calls appropriate handler
-   - Applies compression if needed
-
-6. **File Operations** (FileHandler) - if file route
-   - Validates path safety
-   - Reads/writes file
-   - Returns data
-
-7. **Response Building** (HttpResponse)
-   - Sets status code
-   - Adds headers
-   - Compresses body if applicable
-
-8. **Response Sending** (ConnectionHandler)
-   - Sends via `send()`
-   - Checks `Connection` header
-   - Loops or closes
-
----
-
-## Thread Pool Design
-
-### Architecture
-
-```
-┌─────────────── ThreadPool ───────────────┐
-│                                          │
-│  ┌────────── Task Queue ──────────┐     │
-│  │  std::queue<function<void()>>  │     │
-│  │                                 │     │
-│  │  [Task 1] [Task 2] [Task 3]    │     │
-│  └────────────┬────────────────────┘     │
-│               │                          │
-│  ┌────────────▼───────────────┐          │
-│  │  Mutex + Condition Var     │          │
-│  │  • Lock queue access       │          │
-│  │  • Signal workers          │          │
-│  └────────────┬───────────────┘          │
-│               │                          │
-│  ┌────────────▼────────────┐             │
-│  │  Worker Threads         │             │
-│  │  ┌─────┐ ┌─────┐       │             │
-│  │  │ T1  │ │ T2  │ ... │ TN│            │
-│  │  └─────┘ └─────┘       │             │
-│  └─────────────────────────┘             │
-│                                          │
-└──────────────────────────────────────────┘
-```
-
-### Worker Thread Lifecycle
-
-```
-START
-  │
-  ▼
-WAIT (condition.wait)
-  │
-  ├─notified─> CHECK (stop || !tasks.empty())
-  │               │
-  │               ├─stop && empty─> TERMINATE
-  │               │
-  │               └─!empty────────> GET TASK
-  │                                    │
-  │                                    ▼
-  │                                 EXECUTE
-  │                                    │
-  └────────────────────────────────────┘
-  (Loop back to WAIT)
-```
-
-### Synchronization Details
-
-**Enqueue Operation:**
-```cpp
-{
-    lock_guard<mutex> lock(queue_mutex);  // LOCK
-    tasks.push(task);                      // MODIFY
-}                                          // UNLOCK
-condition.notify_one();                    // SIGNAL
-```
-
-**Worker Operation:**
-```cpp
-{
-    unique_lock<mutex> lock(queue_mutex);        // LOCK
-    condition.wait(lock, predicate);             // WAIT (releases lock)
-    // Woken up + re-acquired lock
-    task = tasks.front();                        // GET
-    tasks.pop();                                 // REMOVE
-}                                                // UNLOCK
-task();                                          // EXECUTE (outside lock!)
-```
-
-**Implementation:** [ThreadPool.hpp](../src/server/ThreadPool.hpp)
-
----
-
-## Error Handling Strategy
-
-### Layers of Defense
-
-1. **Input Validation**
-   - HTTP request parsing
-   - Path traversal checks
-   - Size limits
-
-2. **Exception Handling**
-   - Try-catch in critical sections
-   - Graceful degradation
-   - Error responses to client
-
-3. **Resource Management**
-   - RAII (constructors/destructors)
-   - Smart pointers
-   - Socket cleanup
-
-4. **Logging**
-   - All errors logged with context
-   - Pinglish humor for readability
-
-### Error Response Strategy
+## The route table
 
 ```cpp
-try {
-    // Normal operation
-    return handleRequest();
-} catch (const std::filesystem::filesystem_error& e) {
-    // File system error
-    return HttpResponse::notFound("File not found");
-} catch (const std::exception& e) {
-    // Generic error
-    Logger::error("Exception: " + string(e.what()));
-    return HttpResponse::internalError("Server error");
-} catch (...) {
-    // Unknown error
-    Logger::error("Unknown exception!");
-    return HttpResponse::internalError("Unknown error");
-}
-```
-
----
-
-## Design Patterns
-
-### 1. Factory Pattern
-**Used in:** `HttpResponse`
-
-**Purpose:** Create response objects easily
-
-**Example:**
-```cpp
-// Instead of:
-HttpResponse res(200);
-res.setContentType("text/plain");
-res.setBody("OK");
-
-// Use factory:
-HttpResponse res = HttpResponse::ok("OK");
-```
-
-### 2. Builder Pattern
-**Used in:** `HttpResponse`
-
-**Purpose:** Build complex response step-by-step
-
-**Example:**
-```cpp
-HttpResponse response;
-response.setStatus(200);
-response.setHeader("Content-Type", "text/html");
-response.setHeader("Cache-Control", "no-cache");
-response.setBody(html_content);
-std::string output = response.toString();
-```
-
-### 3. Template Method Pattern
-**Used in:** `RouteHandler`
-
-**Purpose:** Common request handling flow, custom route logic
-
-**Template:**
-```cpp
-HttpResponse handleRequest(HttpRequest& req) {
-    // Common pre-processing
-    log(req);
-    
-    // Route-specific logic - the matched table row
-    HttpResponse res = matchedRoute.handler(ctx);
-    
-    // Common post-processing - owned here, not by each route (Rule 8)
-    applyContentEncoding(res, req);
-    
-    return res;
-}
-```
-
-### 4. Registry / Table-Driven Dispatch
-**Used in:** Routing, and content-coding selection
-
-**Purpose:** Add a route or a content coding as one row of data, not as a new
-branch in a growing if/else.
-
-**Routing example** — the entire mechanism, from `routes/route_registry.cpp`:
-```cpp
-const std::vector<Route> kRouteTable = {
-    {METHOD_GET,  "/",                &handleRoot},
-    {METHOD_GET,  "/echo/{str}",      &handleEcho},
-    {METHOD_GET,  "/files/{name...}", &handleFileGet},
-    {METHOD_POST, "/files/{name...}", &handleFilePost},
-    {METHOD_HEAD, "/",                asHead(&handleRoot)},
-    // ...
+struct Route {
+  const char* method;
+  const char* pattern;
+  RouteHandlerFn handler;
 };
 ```
 
-**Content-coding example** — same idea, applied to `Accept-Encoding`:
+`route_registry.cpp` holds a `constexpr` array of nine entries and a `table()` accessor. Four are `GET` routes, one is
+`POST /files/...`, and four are `HEAD` rows that wrap a `GET` handler through `asHead()`.
+
+`asHead` is a small adapter, not a duplicate table: it runs the underlying handler, then flips
+`HttpResponse::setHeadersOnly(true)`. The body is still built, so `Content-Length` stays truthful — only the
+serialisation changes.
+
+`dispatch()` is the whole routing policy:
+
 ```cpp
-// The candidate set is data, so adding a coding needs no new control flow.
-constexpr ContentEncoding kOffered[] = {ContentEncoding::Gzip, ContentEncoding::Deflate};
+if (path && method match)  { response = handler(ctx); applyContentEncoding(response, request); return response; }
+if (path matches)          { return HttpResponse::methodNotAllowed(...); }   // 405
+                           { return HttpResponse::notFound(...); }           // 404
 ```
 
-### 5. Producer-Consumer Pattern
-**Used in:** `ThreadPool`
+## Path matching
 
-**Purpose:** Decouple connection acceptance from handling
+`pathMatches` splits both path and pattern on `/` using `StringUtils::split`, which **preserves empty tokens**. That is
+load-bearing: it is why `"/"` yields `["", ""]` rather than `[]`, and why a request line containing a double space is
+rejected by `parseRequestLine` rather than silently accepted.
 
-**Components:**
-- **Producer:** Server's accept loop
-- **Consumer:** Worker threads
-- **Queue:** Task queue
-- **Synchronization:** Mutex + Condition Variable
+Two parameter forms:
 
----
+- `{name}` — positional, matches exactly one segment. Does not swallow `/`, so `/echo/a/b` is a `404`.
+- `{name...}` — greedy tail. Returns true as soon as it is reached, so nothing after it is re-checked.
 
-## Performance Considerations
+A literal route compares length first, so `/user-agency` cannot match `/user-agent`.
 
-### 1. Thread Pool Sizing
-- **Formula:** `num_threads = hardware_concurrency()`
-- **Rationale:** Match CPU cores for optimal CPU utilization
-- **Trade-off:** More threads = more concurrency, but higher context switching
+`--name-only` style flags are handled by scanning the argument list in the command file, not by the matcher. The matcher
+knows about patterns only.
 
-### 2. Buffer Sizes
-- **Request buffer:** 8KB (typical HTTP request)
-- **File read:** 8KB chunks
-- **Trade-off:** Larger = fewer system calls, but more memory
+## Connection lifecycle
 
-### 3. Compression Threshold
-- **Minimum size:** 1KB
-- **Rationale:** Overhead > benefit for small files
-- **Compression ratio:** ~60-80% for text
+`ConnectionHandler::handleConnection` is a loop:
 
-### 4. Connection Timeout
-- **Value:** 30 seconds
-- **Rationale:** HTTP/1.1 standard, balance between keep-alive and resource usage
+```cpp
+while (true) {
+  auto read = readRequest(buffer_);        // ReadResult: Ok | Invalid | Closed
+  if (read == Invalid) { send 400; break; }
+  if (read == Closed)  break;
 
----
+  HttpRequest request;
+  request.parse(carved);
 
-## Scalability
+  HttpResponse response = routeHandler_->handleRequest(request);
+  sendResponse(response);
 
-### Current Limits
-- **Concurrent connections:** Limited by thread pool size (~CPU cores)
-- **Request size:** 1MB max
-- **File size:** Unlimited (streaming)
+  if (clientWantsClose(request)) break;    // Connection: close, case-insensitive
+}
+```
 
-### Future Improvements
-- **Event-driven I/O:** epoll/kqueue for >10K connections
-- **HTTP/2:** Multiplexing multiple requests on one connection
-- **Load balancing:** Multiple server instances
+The `Connection` header is inspected **before** the response is sent, so the decision to keep the socket open is made
+with full knowledge of what the client asked for.
 
----
+`readBuffer_` is a member, not a local. That is what makes pipelining work: a second request already sitting in the
+buffer is picked up on the next iteration with no extra `recv`.
 
-**Architecture complete! Server tayar hai!**
+## Content encoding as a policy
 
-**(Architecture complete! Server is ready!)**
+`applyContentEncoding` lives in an anonymous namespace in `route_registry.cpp` and is called from `dispatch` — not from
+inside the routes. Three consequences worth naming:
+
+1. **A route never has to think about compression.** It returns a plain response; the policy layer decides.
+2. **HEAD responses report the length their GET would have had**, because the body is still built before `asHead` strips
+   it from the output.
+3. **The decision is media-type only.** `shouldCompress` never looks at whether the bytes are compressible, and there is
+   no size threshold. `application/octet-stream` is not on the skip list, so a random binary file *is* gzipped — and
+   still round-trips correctly. That is asserted in the integration suite.
+
+A zlib failure falls back to identity. An empty result from `compress` is therefore ambiguous between "identity" and
+"zlib failed", which is safe only because the dispatcher never calls it for identity.
+
+## The file sandbox
+
+```cpp
+bool isPathSafe(const path& candidate) {
+  auto base = std::filesystem::canonical(baseDirectory_);
+  auto full = std::filesystem::weakly_canonical(candidate);
+  return std::mismatch(base, full).first == base.end();
+}
+```
+
+`mismatch` over **path components** rather than characters. That is the difference between rejecting
+`/data/root2` against a base of `/data/root` (correct) and a character-prefix comparison, which would accept it.
+
+`weakly_canonical` on the candidate is deliberate: the file being served usually does not exist yet on a `POST`, and
+`canonical` would throw. Any exception is caught and turned into a denial, so a weird path fails closed.
+
+`readFile` and `writeFile` return `{}` / `false` on every failure and never throw. That is why the routes map failures
+to status codes explicitly rather than catching — the error information is the empty return, not an exception.
+
+## Header storage
+
+`HttpRequest::headers_` and `HttpResponse::headers_` are both `unordered_map<string, string>` — one value per name, and
+`HttpResponse` additionally emits them in unspecified order.
+
+Request lookups (`getHeader`, `hasHeader`) are **case-insensitive**, done by linear scan with `equalsIgnoreCase`.
+Response lookups are **case-sensitive**, using `unordered_map::find`. The asymmetry is real and currently harmless,
+because every internal call site uses the same `HttpConstants` string. It would bite anyone adding a route that mixes
+cases.
+
+`HttpRequest::parseHeaderLine` comma-joins a repeated name rather than overwriting it, per RFC 9110 §5.3. The
+`unordered_map` would otherwise give last-one-wins, which silently drops an `Accept-Encoding` offer.
+
+## Adding a route
+
+1. Write a handler in `src/handlers/routes/<name>_route.cpp` returning an `HttpResponse`.
+2. Declare it in `src/handlers/routes/route_handlers.hpp`.
+3. Add a row to the array in `route_registry.cpp`.
+
+Add a `HEAD` row too, via `asHead`, if the route should answer `HEAD`. There is no automatic derivation.
+
+`routeCount()` exists and is asserted in the unit test, so a forgotten row fails a test rather than shipping silently.
+
+## File map
+
+| Path | Responsibility |
+|---|---|
+| `src/main.cpp` | `--directory`, `--verbose`, signal handlers, `DEFAULT_PORT` |
+| `src/server/Server.cpp` | socket setup, `acceptLoop`, `stop` |
+| `src/server/ThreadPool.cpp` | worker construction, queue, shutdown |
+| `src/handlers/ConnectionHandler.cpp` | keep-alive loop, framing, `sendAll` |
+| `src/handlers/RouteHandler.cpp` | forwards to `routes::dispatch` |
+| `src/handlers/routes/route_registry.cpp` | route table, matcher, dispatch, encoding policy |
+| `src/handlers/routes/head_adapter.cpp` | `asHead` |
+| `src/handlers/FileHandler.cpp` | the sandbox, read, write |
+| `src/compression/response_encoder.cpp` | gzip and raw deflate, skip list |
+| `src/compression/encoding_negotiator.cpp` | `Accept-Encoding` parsing and choice |
+| `src/compression/content_encoding.cpp` | header-value spelling |
+| `src/http/HttpRequest.cpp` | parsing, header merge, case-insensitive lookup |
+| `src/http/HttpResponse.cpp` | factories, serialisation, HEAD mode |
+| `src/http/HttpConstants.cpp` | status text, MIME guessing |
+
+## Conventions
+
+- **Every header has a matching `.cpp`, with one exception.** `routes/route_handlers.hpp` is declaration-only; its
+  functions live in the per-route files.
+- **Bilingual Punjabi/English file headers** across `src/`, though many files are largely English inside.
+- **Diagnostics to stderr, results to stdout.** The integration suite parses stdout, so nothing else may write there.
+- **No third-party HTTP library.** zlib for compression, POSIX for everything else. `vcpkg.json` exists because the
+  CodeCrafters image expects it, but the local build uses system zlib.
+- **Errors are status codes, not exceptions.** Handlers return a `HttpResponse`; nothing above `FileHandler` throws.
+- **Tests link `libhttpcore.a`**, so a unit test can never pass against a divergent copy of the code.
