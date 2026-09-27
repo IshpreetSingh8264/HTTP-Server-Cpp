@@ -36,6 +36,7 @@ private:
     std::unordered_map<std::string, std::string> headers_; // Response headers
     std::string body_;                                     // Response body
     bool isCompressed_;                                    // Body compressed?
+    bool headersOnly_;                                     // HEAD: suppress the body
 
 public:
     explicit HttpResponse(int statusCode = HttpConstants::STATUS_OK);
@@ -62,6 +63,11 @@ public:
     const std::string& getBody() const { return body_; }
     bool isCompressed() const { return isCompressed_; }
     int getStatusCode() const { return statusCode_; }
+
+    /// HEAD: serialise the status line and headers but not the body. The body
+    /// is still built, so Content-Length stays truthful.
+    void setHeadersOnly(bool headersOnly) { headersOnly_ = headersOnly; }
+    bool isHeadersOnly() const { return headersOnly_; }
 
     // ==================== Serialisation ====================
 

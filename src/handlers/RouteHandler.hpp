@@ -1,11 +1,10 @@
 #pragma once
 
-// RouteHandler.hpp - URL routing te request handling
-// Different URLs lai different responses!
-// (Different responses for different URLs!)
+// RouteHandler.hpp - The HTTP dispatcher
+// Route table de upar request chalao - apna koi routing logic nahi.
+// (Run the request through the route table - no routing logic of its own.)
 
 #include <memory>
-#include <string>
 
 #include "handlers/FileHandler.hpp"
 #include "http/HttpRequest.hpp"
@@ -14,39 +13,23 @@
 namespace handlers {
 
 /**
- * RouteHandler - Turn an HttpRequest into an HttpResponse
+ * RouteHandler - Turns an HttpRequest into an HttpResponse
  *
- * Purpose: URL path de hisaab se appropriate response bhejo
- *          (Send the appropriate response based on the URL path)
+ * Purpose: Hold the request's dependencies and hand off to the route table
+ *          (Hold the request's dependencies and hand off to the route table)
  *
- * Supported routes:
- * - GET /              -> 200 OK
- * - GET /echo/{str}    -> Echo back the string
- * - GET /user-agent    -> Return User-Agent header
- * - GET /files/{name}  -> Return file contents
- * - POST /files/{name} -> Save file
- *
- * TODO(item 2): this class still owns an if-chain; it is meant to shrink to a
- * dispatcher over a data-driven route table.
+ * All routing decisions live in handlers/routes/route_registry.cpp. This class
+ * exists so ConnectionHandler depends on one interface rather than on a
+ * std::function plus a FileHandler.
  */
 class RouteHandler {
 private:
     std::shared_ptr<FileHandler> fileHandler_;  // File operations lai
 
-    http::HttpResponse handleGetRequest(const http::HttpRequest& request);
-    http::HttpResponse handlePostRequest(const http::HttpRequest& request);
-    http::HttpResponse handleRoot(const http::HttpRequest& request);
-    http::HttpResponse handleEcho(const http::HttpRequest& request);
-    http::HttpResponse handleUserAgent(const http::HttpRequest& request);
-    http::HttpResponse handleFileGet(const http::HttpRequest& request);
-    http::HttpResponse handleFilePost(const http::HttpRequest& request);
-    void applyCompression(http::HttpResponse& response, const std::string& data,
-                          const http::HttpRequest& request);
-
 public:
     explicit RouteHandler(std::shared_ptr<FileHandler> fileHandler);
 
-    /// Handle a request and produce the response. Never throws for bad input.
+    /// Dispatch one request. Never throws for malformed input.
     http::HttpResponse handleRequest(const http::HttpRequest& request);
 };
 

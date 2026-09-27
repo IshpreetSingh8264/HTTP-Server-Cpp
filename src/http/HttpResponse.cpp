@@ -11,7 +11,8 @@ namespace http {
 HttpResponse::HttpResponse(int statusCode)
     : statusCode_(statusCode),
       version_(HttpConstants::VERSION_1_1),
-      isCompressed_(false) {
+      isCompressed_(false),
+      headersOnly_(false) {
     statusText_ = HttpConstants::getStatusText(statusCode);
     utils::Logger::debug("Response bana rahe haan: " + std::to_string(statusCode) + " " + statusText_);
 }
@@ -62,6 +63,11 @@ std::string HttpResponse::getHeader(const std::string& name) const {
 }
 
 std::string HttpResponse::toString() const {
+    // HEAD: same status line and headers, no body on the wire.
+    if (headersOnly_) {
+        return toStringHeadersOnly();
+    }
+
     std::ostringstream oss;
 
     oss << version_ << " " << statusCode_ << " " << statusText_ << HttpConstants::CRLF;
