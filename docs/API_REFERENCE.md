@@ -18,7 +18,9 @@ This document provides comprehensive API documentation for all classes, methods,
    - [HttpRequest](#httprequest)
    - [HttpResponse](#httpresponse)
 3. [Compression](#compression)
-   - [GzipCompressor](#gzipcompressor)
+   - [ContentEncoding](#contentencoding)
+   - [EncodingNegotiator](#encodingnegotiator)
+   - [ResponseEncoder](#responseencoder)
 4. [Handlers](#handlers)
    - [FileHandler](#filehandler)
    - [RouteHandler](#routehandler)
@@ -33,7 +35,7 @@ This document provides comprehensive API documentation for all classes, methods,
 
 ### Logger
 
-**File:** [include/utils/Logger.hpp](../include/utils/Logger.hpp)
+**File:** [src/utils/Logger.hpp](../src/utils/Logger.hpp)
 
 **Purpose:** Thread-safe logging system with Pinglish messages and color support.
 
@@ -105,7 +107,7 @@ Logger::error("Socket bind fail ho gaya!");
 
 ### StringUtils
 
-**File:** [include/utils/StringUtils.hpp](../include/utils/StringUtils.hpp)
+**File:** [src/utils/StringUtils.hpp](../src/utils/StringUtils.hpp)
 
 **Purpose:** String manipulation utilities for HTTP parsing.
 
@@ -238,7 +240,7 @@ std::string decoded = StringUtils::urlDecode("hello%20world");
 
 ### HttpConstants
 
-**File:** [include/http/HttpConstants.hpp](../include/http/HttpConstants.hpp)
+**File:** [src/http/HttpConstants.hpp](../src/http/HttpConstants.hpp)
 
 **Purpose:** Centralized HTTP protocol constants.
 
@@ -310,7 +312,7 @@ std::string mime = HttpConstants::getMimeType("index.html");
 
 ### HttpRequest
 
-**File:** [include/http/HttpRequest.hpp](../include/http/HttpRequest.hpp)
+**File:** [src/http/HttpRequest.hpp](../src/http/HttpRequest.hpp)
 
 **Purpose:** Parse and represent HTTP requests.
 
@@ -458,7 +460,7 @@ std::string body = req.getBody();
 
 ### HttpResponse
 
-**File:** [include/http/HttpResponse.hpp](../include/http/HttpResponse.hpp)
+**File:** [src/http/HttpResponse.hpp](../src/http/HttpResponse.hpp)
 
 **Purpose:** Build HTTP responses.
 
@@ -522,21 +524,34 @@ response.setBody("<html>Hello</html>");
 
 ---
 
-##### `void setCompressedBody(const std::string& compressed, const std::string& encoding)`
+##### `void setCompressedBody(const std::vector<char>& compressed, const std::string& encoding)`
 
-Sets compressed response body.
+Sets a pre-compressed response body.
 
 **Parameters:**
-- `compressed` - Compressed body data
-- `encoding` - Encoding type (e.g., "gzip")
+- `compressed` - Compressed body bytes, from `ResponseEncoder`
+- `encoding` - the `Content-Encoding` token, from `toHeaderValue(...)`
 
 **Example:**
 ```cpp
-auto compressed = GzipCompressor::compress(body);
-response.setCompressedBody(compressed, "gzip");
+auto coding = EncodingNegotiator::negotiate(req.getHeader("Accept-Encoding"));
+auto body = ResponseEncoder::compress(payload, coding);
+if (!body.empty()) {
+    response.setCompressedBody(body, toHeaderValue(coding));
+}
 ```
 
-**Note:** Sets both Content-Length and Content-Encoding headers.
+**Note:** Sets both `Content-Length` and `Content-Encoding`, and records
+`isCompressed()`.
+
+---
+
+##### `void setHeadersOnly(bool headersOnly)`
+
+Marks the response as a HEAD response: `toString()` then emits the status line
+and headers but no body. The body is still built, so `Content-Length` reports
+what the equivalent GET would have sent. Reached through
+`asHead()` in `head_adapter.cpp`, never by a route directly.
 
 ---
 
@@ -644,74 +659,99 @@ HttpResponse res = HttpResponse::internalError("Database error");
 
 ## Compression
 
-### GzipCompressor
+### ContentEncoding
 
-**File:** [include/compression/GzipCompressor.hpp](../include/compression/GzipCompressor.hpp)
+**File:** [src/compression/content_encoding.hpp](../src/compression/content_encoding.hpp)
 
-**Purpose:** Gzip compression using zlib.
+**Purpose:** The content codings this server can emit.
 
-#### Methods
-
-##### `static std::string compress(const std::string& data)`
-
-Compresses data using gzip.
-
-**Parameters:**
-- `data` - Uncompressed data
-
-**Returns:** Gzip-compressed data
-
-**Throws:** `std::runtime_error` if compression fails
-
-**Example:**
 ```cpp
-std::string original = "Hello World! " * 100;  // Large text
-std::string compressed = GzipCompressor::compress(original);
+enum class ContentEncoding { Identity, Gzip, Deflate };
 ```
 
-**Algorithm:** DEFLATE with gzip wrapper (zlib windowBits=15|16)
+| Function | Returns |
+|---|---|
+| `toHeaderValue(ContentEncoding)` | the exact `Content-Encoding` token |
+| `toAcceptEncodingToken(ContentEncoding)` | the `Accept-Encoding` token |
+| `fromHeaderValue(std::string)` | `ContentEncoding`; unknown tokens become `Identity` |
 
 ---
 
-##### `static bool supportsGzip(const std::string& acceptEncoding)`
+### EncodingNegotiator
 
-Checks if client supports gzip.
+**File:** [src/compression/encoding_negotiator.hpp](../src/compression/encoding_negotiator.hpp)
 
-**Parameters:**
-- `acceptEncoding` - Accept-Encoding header value
+**Purpose:** Turn an `Accept-Encoding` header into one `Content-Encoding`
+value. This is the substance of CodeCrafters stage `ij8`.
 
-**Returns:** `true` if "gzip" found, `false` otherwise
+##### `static ContentEncoding negotiate(const std::string& acceptEncoding)`
+
+Priority order:
+
+1. highest `q` wins; `coding;q=0` refuses that coding
+2. on a `q` tie, the coding the client listed **first** wins
+3. a bare `*` accepts any coding the server can produce
+4. `identity` is the fallback, so an absent or unusable header yields an
+   uncompressed response rather than a 406
 
 **Example:**
 ```cpp
-std::string ae = req.getHeader("Accept-Encoding");
-if (GzipCompressor::supportsGzip(ae)) {
-    // Compress response
-}
+negotiate("gzip");                      // Gzip
+negotiate("deflate");                   // Deflate
+negotiate("gzip, deflate");             // Gzip   (first listed wins)
+negotiate("deflate, gzip");             // Deflate
+negotiate("gzip;q=0.1, deflate;q=0.9"); // Deflate (higher q wins)
+negotiate("gzip;q=0");                  // Identity (refused)
+negotiate("*");                         // Gzip (server preference)
+negotiate("br");                        // Identity (unsupported coding)
+negotiate("");                          // Identity (never compress unasked)
 ```
+
+##### `static std::vector<EncodingPreference> parse(const std::string& acceptEncoding)`
+
+Splits, lower-cases, and reads the `;q=` weights out of each element. Exposed
+for diagnostics and tests.
 
 ---
 
-##### `static bool shouldCompress(const std::string& contentType, size_t dataSize)`
+### ResponseEncoder
 
-Determines if compression is beneficial.
+**File:** [src/compression/response_encoder.hpp](../src/compression/response_encoder.hpp)
 
-**Parameters:**
-- `contentType` - Content-Type header value
-- `dataSize` - Data size in bytes
+**Purpose:** Compress a response body with zlib. Both codings are the same
+DEFLATE algorithm; they differ only in the container.
 
-**Returns:** `true` if should compress, `false` otherwise
+| Constant | `deflateInit2` windowBits | Container |
+|---|---|---|
+| `GZIP_WINDOW_BITS` | `15 + 16` | gzip, RFC 1952 |
+| `DEFLATE_WINDOW_BITS` | `-15` | raw deflate, RFC 1951 |
 
-**Logic:**
-- Data size must be > 1024 bytes (1KB)
-- Content-Type must start with "text/" or be "application/json"
+##### `static std::vector<char> compress(const std::string& data, ContentEncoding encoding)`
+
+**Returns:** the compressed bytes, or an **empty vector** on failure. The
+caller treats an empty result as "send it uncompressed" and never fails the
+request over compression. `Identity` returns empty by definition.
 
 **Example:**
 ```cpp
-if (GzipCompressor::shouldCompress("text/html", body.size())) {
-    auto compressed = GzipCompressor::compress(body);
+auto body = compression::ResponseEncoder::compress(payload, ContentEncoding::Deflate);
+if (!body.empty()) {
+    response.setCompressedBody(body, compression::toHeaderValue(ContentEncoding::Deflate));
 }
 ```
+
+##### `static bool shouldCompress(const std::string& data, const std::string& contentType)`
+
+False for an empty body, and false for a content type that is already
+compressed (`image/*`, `video/*`, `audio/*`, `application/zip`,
+`application/gzip`) — those only grow.
+
+There is deliberately **no minimum-size threshold**: the CodeCrafters harness
+expects compression even on tiny bodies.
+
+**Note on `deflate`.** RFC 9110 nominally defines the coding as the zlib
+format (RFC 1950, a positive windowBits), but in practice every browser and
+curl send and expect a raw RFC 1951 stream, which is what this produces.
 
 ---
 
@@ -719,7 +759,7 @@ if (GzipCompressor::shouldCompress("text/html", body.size())) {
 
 ### FileHandler
 
-**File:** [include/handlers/FileHandler.hpp](../include/handlers/FileHandler.hpp)
+**File:** [src/handlers/FileHandler.hpp](../src/handlers/FileHandler.hpp)
 
 **Purpose:** Safe file I/O with path traversal protection.
 
@@ -842,7 +882,7 @@ handler.deleteFile("temp.txt");
 
 ### RouteHandler
 
-**File:** [include/handlers/RouteHandler.hpp](../include/handlers/RouteHandler.hpp)
+**File:** [src/handlers/RouteHandler.hpp](../src/handlers/RouteHandler.hpp)
 
 **Purpose:** URL routing and request handling.
 
@@ -892,41 +932,15 @@ HttpResponse res = routes.handleRequest(req);
 
 ---
 
-##### `HttpResponse handleGetRequest(const HttpRequest& request)`
-
-Handles GET requests.
-
-**Parameters:**
-- `request` - HTTP request
-
-**Returns:** HttpResponse
-
-**Internal Routing:**
-```cpp
-if (path == "/") return handleRoot();
-if (startsWith(path, "/echo/")) return handleEcho(request);
-if (path == "/user-agent") return handleUserAgent(request);
-if (startsWith(path, "/files/")) return handleFileGet(request);
-```
-
----
-
-##### `HttpResponse handlePostRequest(const HttpRequest& request)`
-
-Handles POST requests.
-
-**Parameters:**
-- `request` - HTTP request
-
-**Returns:** HttpResponse
-
-**Routing:** Only `/files/{name}` supported for POST
+`RouteHandler` no longer contains per-method or per-path branches. The whole
+routing mechanism is [routes/route_registry.cpp](../src/handlers/routes/route_registry.cpp);
+see its section below.
 
 ---
 
 ### ConnectionHandler
 
-**File:** [include/handlers/ConnectionHandler.hpp](../include/handlers/ConnectionHandler.hpp)
+**File:** [src/handlers/ConnectionHandler.hpp](../src/handlers/ConnectionHandler.hpp)
 
 **Purpose:** Socket I/O and persistent connection management.
 
@@ -1009,7 +1023,7 @@ handler.sendResponse(client_fd, response);
 
 ### ThreadPool
 
-**File:** [include/server/ThreadPool.hpp](../include/server/ThreadPool.hpp)
+**File:** [src/server/ThreadPool.hpp](../src/server/ThreadPool.hpp)
 
 **Purpose:** Worker thread pool for concurrent request handling.
 
@@ -1074,7 +1088,7 @@ pool.enqueue([socket]() {
 
 ### Server
 
-**File:** [include/server/Server.hpp](../include/server/Server.hpp)
+**File:** [src/server/Server.hpp](../src/server/Server.hpp)
 
 **Purpose:** Main HTTP server orchestrator.
 
@@ -1170,64 +1184,80 @@ void Server::acceptLoop() {
     }
 }
 
-// Inside ConnectionHandler::handleClient()
-void ConnectionHandler::handleClient(int socket) {
-    setSocketTimeout(socket, 30);
-    
-    bool keepAlive = true;
-    while (keepAlive) {
-        std::string rawReq = readRequest(socket);
-        
-        HttpRequest req;
-        req.parse(rawReq);
-        
-        HttpResponse res = routeHandler_->handleRequest(req);
-        
-        if (req.getHeader("Connection") == "close") {
-            keepAlive = false;
-            res.setHeader("Connection", "close");
+// Inside ConnectionHandler::handleRequest(): the framing that makes
+// pipelining work. readBuffer_ survives across calls, so one recv() that
+// returns the end of request N and the start of request N+1 is fine.
+ConnectionHandler::ReadResult ConnectionHandler::readRequest(std::string& out) {
+    out.clear();
+    for (;;) {
+        const size_t headerEnd = readBuffer_.find("\r\n\r\n");
+        if (headerEnd != std::string::npos) {
+            const size_t bodyStart = headerEnd + 4;
+            size_t contentLength = 0;
+            bool hasBody = false;
+
+            HttpRequest probe;
+            if (probe.parse(readBuffer_)) {
+                const std::string declared = probe.getHeader("Content-Length");
+                if (!declared.empty()) {
+                    // digits only: "abc", "-5" and out-of-range are all refused
+                    if (!parseContentLength(declared, MAX_REQUEST_SIZE, contentLength)) {
+                        return ReadResult::Invalid;   // -> 400
+                    }
+                    hasBody = true;
+                }
+            }
+
+            const size_t needed = bodyStart + (hasBody ? contentLength : 0);
+            if (readBuffer_.size() >= needed) {
+                out = readBuffer_.substr(0, needed);   // exactly one request
+                readBuffer_.erase(0, needed);          // surplus stays buffered
+                return ReadResult::Ok;
+            }
         }
-        
-        sendResponse(socket, res);
+        // ... recv() more bytes, or return Closed on EOF/timeout
     }
-    
-    close(socket);
 }
 
-// Inside RouteHandler::handleRequest()
+// Inside RouteHandler::handleRequest(): a dispatcher, nothing more.
 HttpResponse RouteHandler::handleRequest(const HttpRequest& req) {
-    std::string path = req.getPath();
-    
-    if (path == "/") {
-        return HttpResponse::ok();
-    }
-    
-    if (StringUtils::startsWith(path, "/echo/")) {
-        std::string str = path.substr(6);
-        HttpResponse res = HttpResponse::ok(str);
-        applyCompression(res, req);
-        return res;
-    }
-    
-    return HttpResponse::notFound();
+    return routes::dispatch(req, fileHandler_);
 }
 
-// Compression helper
-void RouteHandler::applyCompression(HttpResponse& res, const HttpRequest& req) {
-    std::string ae = req.getHeader("Accept-Encoding");
-    
-    if (!GzipCompressor::supportsGzip(ae)) return;
-    
-    std::string body = res.getBody();
+// Inside routes::dispatch(): resolution order, then compression once.
+for (const Route& route : routeTable()) {
+    if (!pathMatches(req.getPath(), route.pathPattern)) continue;
+    pathMatchedSomeRoute = true;
+    if (req.getMethod() != route.method) continue;
+
+    HttpResponse response = route.handler(RouteContext{req, fileHandler_});
+    applyContentEncoding(response, req);   // dispatcher owns this (Rule 8)
+    return response;
+}
+return pathMatchedSomeRoute ? HttpResponse::methodNotAllowed(...)
+                            : HttpResponse::notFound(...);
+
+// The compression policy lives here, not in any route: whether a body may be
+// compressed depends on the request and the response, not on the endpoint.
+void applyContentEncoding(HttpResponse& res, const HttpRequest& req) {
+    const ContentEncoding coding =
+        EncodingNegotiator::negotiate(req.getHeader("Accept-Encoding"));
+
+    if (coding == ContentEncoding::Identity) return;
+
+    // The response's Content-Type decides, not the request's.
     std::string contentType = res.getHeader("Content-Type");
-    
-    if (!GzipCompressor::shouldCompress(contentType, body.size())) return;
-    
-    std::string compressed = GzipCompressor::compress(body);
-    res.setCompressedBody(compressed, "gzip");
-    
-    Logger::info("Compressed: " + std::to_string(body.size()) + " → " + 
-                 std::to_string(compressed.size()) + " bytes");
+    if (contentType.empty()) contentType = MIME_TEXT_PLAIN;
+
+    if (!ResponseEncoder::shouldCompress(res.getBody(), contentType)) return;
+
+    const auto compressed = ResponseEncoder::compress(res.getBody(), coding);
+
+    // An empty result means compression failed: fall back to identity rather
+    // than failing the request.
+    if (!compressed.empty()) {
+        res.setCompressedBody(compressed, toHeaderValue(coding));
+    }
 }
 ```
 

@@ -85,7 +85,7 @@ if (server_fd < 0) {
 - `SOCK_STREAM` - TCP (reliable, connection-oriented)
 - `0` - Protocol (0 = auto-select TCP for SOCK_STREAM)
 
-**Implementation:** See [Server.cpp:createSocket()](../include/server/Server.hpp#L139)
+**Implementation:** See [Server.cpp:createSocket()](../src/server/Server.hpp#L139)
 
 ### Socket Options - SO_REUSEADDR
 
@@ -106,7 +106,7 @@ if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) 
 }
 ```
 
-**Implementation:** See [Server.cpp:setSocketOptions()](../include/server/Server.hpp#L156)
+**Implementation:** See [Server.cpp:setSocketOptions()](../src/server/Server.hpp#L156)
 
 ### Binding to Address
 
@@ -129,7 +129,7 @@ if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
 > 
 > Use `htons()` (host to network short) to convert!
 
-**Implementation:** See [Server.cpp:bindSocket()](../include/server/Server.hpp#L171)
+**Implementation:** See [Server.cpp:bindSocket()](../src/server/Server.hpp#L171)
 
 ### Listening for Connections
 
@@ -147,7 +147,7 @@ if (listen(server_fd, backlog) != 0) {
 > 
 > (How many pending connections can be queued - if server is busy)
 
-**Implementation:** See [Server.cpp:listenForConnections()](../include/server/Server.hpp#L190)
+**Implementation:** See [Server.cpp:listenForConnections()](../src/server/Server.hpp#L190)
 
 ### Accepting Connections
 
@@ -173,7 +173,7 @@ printf("Client connected: %s\n", client_ip);
 - `accept()` is **blocking** - waits until client connects
 - For concurrent servers, run in loop and dispatch to threads
 
-**Implementation:** See [Server.cpp:acceptLoop()](../include/server/Server.hpp#L203)
+**Implementation:** See [Server.cpp:acceptLoop()](../src/server/Server.hpp#L203)
 
 ### Reading & Writing Data
 
@@ -202,7 +202,7 @@ if (bytes_sent < 0) {
 }
 ```
 
-**Implementation:** See [ConnectionHandler.cpp](../include/handlers/ConnectionHandler.hpp)
+**Implementation:** See [ConnectionHandler.cpp](../src/handlers/ConnectionHandler.hpp)
 
 ---
 
@@ -251,7 +251,7 @@ path_ = parts[1];     // /echo/hello
 version_ = parts[2];  // HTTP/1.1
 ```
 
-**Implementation:** See [HttpRequest.cpp:parse()](../include/http/HttpRequest.hpp#L39)
+**Implementation:** See [HttpRequest.cpp:parse()](../src/http/HttpRequest.hpp#L39)
 
 ### HTTP Response Format
 
@@ -281,7 +281,7 @@ response << "\r\n";
 response << body;
 ```
 
-**Implementation:** See [HttpResponse.cpp:toString()](../include/http/HttpResponse.hpp#L115)
+**Implementation:** See [HttpResponse.cpp:toString()](../src/http/HttpResponse.hpp#L115)
 
 ### HTTP Status Codes
 
@@ -293,7 +293,7 @@ response << body;
 | 404 | Not Found | Resource doesn't exist |
 | 500 | Internal Server Error | Server crashed |
 
-**Implementation:** See [HttpConstants.hpp](../include/http/HttpConstants.hpp)
+**Implementation:** See [HttpConstants.hpp](../src/http/HttpConstants.hpp)
 
 ### MIME Types
 
@@ -318,7 +318,7 @@ std::string getMimeType(const std::string& filename) {
 }
 ```
 
-**Implementation:** See [HttpConstants.cpp:getMimeType()](../include/http/HttpConstants.hpp#L129)
+**Implementation:** See [HttpConstants.cpp:getMimeType()](../src/http/HttpConstants.hpp#L129)
 
 ---
 
@@ -431,7 +431,7 @@ public:
 };
 ```
 
-**Implementation:** See [ThreadPool.hpp](../include/server/ThreadPool.hpp)
+**Implementation:** See [ThreadPool.hpp](../src/server/ThreadPool.hpp)
 
 ### Synchronization Primitives
 
@@ -496,7 +496,7 @@ unsigned int num_threads = std::thread::hardware_concurrency();
 > 
 > (Optimal threads based on CPU cores - not too many, not too few)
 
-**Implementation:** See [ThreadPool.hpp:constructor](../include/server/ThreadPool.hpp#L56)
+**Implementation:** See [ThreadPool.hpp:constructor](../src/server/ThreadPool.hpp#L56)
 
 ---
 
@@ -567,52 +567,77 @@ std::vector<char> compress_gzip(const std::string& data) {
 }
 ```
 
-**Implementation:** See [GzipCompressor.cpp:compress()](../include/compression/GzipCompressor.hpp#L37)
+**Implementation:** See [response_encoder.cpp](../src/compression/response_encoder.cpp)
 
 ### Content Negotiation
 
-**Client Request:**
+`Accept-Encoding` is a *preference list*, not a set of booleans. The server
+picks exactly one coding from it.
+
+**Client request:**
 ```
 GET /data HTTP/1.1
-Accept-Encoding: gzip, deflate, br
+Accept-Encoding: gzip;q=0.5, deflate;q=0.9, br
 ```
 
-**Server checks:**
-1. Parse `Accept-Encoding` header
-2. Check if server supports gzip
-3. Compress response
-4. Add `Content-Encoding: gzip` header
+**Server:**
+1. Split on commas, lower-case, read the `;q=` weight of each element
+2. Drop codings the server cannot produce (`br` here)
+3. Score the codings it *can* produce, using the wildcard `*` if present
+4. Take the highest `q`; on a tie, the one the client listed first
+5. Fall back to `identity` if nothing is acceptable
 
-**Code Snippet:**
 ```cpp
-std::string accept_encoding = request.getHeader("Accept-Encoding");
+const ContentEncoding coding =
+    EncodingNegotiator::negotiate(request.getHeader("Accept-Encoding"));
+// -> ContentEncoding::Deflate, because q=0.9 beats gzip's q=0.5
 
-if (contains(toLower(accept_encoding), "gzip")) {
-    auto compressed = GzipCompressor::compress(body);
-    response.setCompressedBody(compressed, "gzip");
+if (coding != ContentEncoding::Identity) {
+    auto compressed = ResponseEncoder::compress(body, coding);
+    if (!compressed.empty()) {
+        response.setCompressedBody(compressed, toHeaderValue(coding));
+    }
 }
 ```
 
-**Implementation:** See [RouteHandler.cpp:applyCompression()](../include/handlers/RouteHandler.hpp#L308)
+Two details worth knowing:
+
+- **`identity` is the safe default.** If the header is absent, or every listed
+  coding is refused with `q=0`, the response is sent uncompressed rather than
+  rejected. A 406 would be more strictly correct and is not implemented.
+- **An empty result means "do not compress", not "fail".** If zlib returns
+  nothing, the uncompressed body is sent. Compression is never allowed to turn
+  a good response into an error.
+
+**Implementation:** See [encoding_negotiator.cpp](../src/compression/encoding_negotiator.cpp),
+called from [route_registry.cpp](../src/handlers/routes/route_registry.cpp)
 
 ### When NOT to Compress
 
 **Don't compress:**
-- Small files (< 1KB) - overhead > benefit
-- Already compressed (images, videos, zip files)
+- Already-compressed payloads — images, video, audio, zip. They only grow.
+- An empty body. There is nothing to send, so `Content-Length: 0` stands.
+
+A minimum-size threshold is the usual third rule, and it is deliberately
+**absent** here: a 1 KB floor is right for a public web server, but the
+CodeCrafters harness expects compression on tiny bodies too.
 
 ```cpp
-bool should_compress(const std::string& data, const std::string& content_type) {
-    if (data.size() < 1024) return false;  // Too small
-    
-    if (contains(content_type, "image/")) return false;  // Already compressed
-    if (contains(content_type, "video/")) return false;
-    
-    return true;  // Text files benefit from compression
+bool ResponseEncoder::shouldCompress(const std::string& data,
+                                     const std::string& contentType) {
+    if (data.empty()) return false;
+
+    const std::string lower = toLower(contentType);
+    if (contains(lower, "image/") || contains(lower, "video/") ||
+        contains(lower, "audio/") || contains(lower, "application/zip") ||
+        contains(lower, "application/gzip")) {
+        return false;
+    }
+    return true;
 }
 ```
 
-**Implementation:** See [GzipCompressor.cpp:shouldCompress()](../include/compression/GzipCompressor.hpp#L115)
+**Implementation:** See [response_encoder.cpp:shouldCompress()](../src/compression/response_encoder.cpp)
 
 ---
 
@@ -698,7 +723,7 @@ void handleConnection(int client_socket) {
 }
 ```
 
-**Implementation:** See [ConnectionHandler.cpp:handleConnection()](../include/handlers/ConnectionHandler.hpp#L53)
+**Implementation:** See [ConnectionHandler.cpp:handleConnection()](../src/handlers/ConnectionHandler.hpp#L53)
 
 ### Timeout Handling
 
@@ -718,7 +743,7 @@ setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
 Now `recv()` will return error after 30 seconds of no data.
 
-**Implementation:** See [ConnectionHandler.cpp:setSocketTimeout()](../include/handlers/ConnectionHandler.hpp#L109)
+**Implementation:** See [ConnectionHandler.cpp:setSocketTimeout()](../src/handlers/ConnectionHandler.hpp#L109)
 
 ---
 
@@ -749,7 +774,7 @@ bool is_path_safe(const std::filesystem::path& requested_path) {
 }
 ```
 
-**Implementation:** See [FileHandler.cpp:isPathSafe()](../include/handlers/FileHandler.hpp#L235)
+**Implementation:** See [FileHandler.cpp:isPathSafe()](../src/handlers/FileHandler.hpp#L235)
 
 ### Request Size Limits
 
@@ -764,7 +789,7 @@ if (request.size() > MAX_REQUEST_SIZE) {
 }
 ```
 
-**Implementation:** See [ConnectionHandler.cpp:readRequest()](../include/handlers/ConnectionHandler.hpp#L134)
+**Implementation:** See [ConnectionHandler.cpp:readRequest()](../src/handlers/ConnectionHandler.hpp#L134)
 
 ### Timeout Protection
 
@@ -774,7 +799,7 @@ if (request.size() > MAX_REQUEST_SIZE) {
 - Set `SO_RCVTIMEO` socket option (30 seconds)
 - Close connection if no data received
 
-**Implementation:** See [ConnectionHandler.cpp:setSocketTimeout()](../include/handlers/ConnectionHandler.hpp#L109)
+**Implementation:** See [ConnectionHandler.cpp:setSocketTimeout()](../src/handlers/ConnectionHandler.hpp#L109)
 
 ---
 
@@ -789,7 +814,7 @@ if (request.size() > MAX_REQUEST_SIZE) {
 5. **Persistence** - Keep-alive connections reduce latency
 6. **Security** - Validate paths, limit sizes, set timeouts
 
-**Complete Implementation:** See [Server.hpp](../include/server/Server.hpp) - ties everything together!
+**Complete Implementation:** See [Server.hpp](../src/server/Server.hpp) - ties everything together!
 
 ---
 

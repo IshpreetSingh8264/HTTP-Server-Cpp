@@ -59,10 +59,12 @@ This document describes the architecture, module interactions, and design patter
 │         ┌──────────────┴────────────────┐                 │
 │         │                               │                 │
 │    ┌────▼─────────┐            ┌────────▼──────────┐     │
-│    │ FileHandler  │            │ GzipCompressor    │     │
-│    │ • Read files │            │ • Compress data   │     │
-│    │ • Write files│            │ • Check encoding  │     │
-│    │ • Path safety│            │ • Detect support  │     │
+│    │ FileHandler  │            │  compression::    │     │
+│    │ • Read files │            │   Negotiator      │     │
+│    │ • Write files│            │   • parse A-E     │     │
+│    │ • Path safety│            │   • pick coding   │     │
+│    │              │            │  Encoder          │     │
+│    │              │            │   • gzip / deflate│     │
 │    └──────────────┘            └───────────────────┘     │
 │                                                            │
 └────────────────────────────────────────────────────────────┘
@@ -74,16 +76,16 @@ This document describes the architecture, module interactions, and design patter
 |-------|----------------|-------------|
 | **Entry** | Application startup, config | `main.cpp` |
 | **Server** | Socket lifecycle, orchestration | `Server`, `ThreadPool` |
-| **Handler** | Request processing, routing | `ConnectionHandler`, `RouteHandler`, `FileHandler` |
+| **Handler** | Request framing, routing, file IO | `ConnectionHandler`, `RouteHandler`, `FileHandler` |
 | **Protocol** | HTTP parsing & building | `HttpRequest`, `HttpResponse`, `HttpConstants` |
-| **Compression** | Data compression | `GzipCompressor` |
+| **Compression** | Coding negotiation and encoding | `EncodingNegotiator`, `ResponseEncoder`, `ContentEncoding` |
 | **Utilities** | Cross-cutting concerns | `Logger`, `StringUtils` |
 
 ---
 
 ## Module Architecture
 
-### 1. Server Module (`include/server/`)
+### 1. Server Module (`src/server/`)
 
 **Purpose:**
 > Server de core functionality - socket setup te connection management
@@ -126,11 +128,11 @@ This document describes the architecture, module interactions, and design patter
 accept() → enqueue(task) → notify_one() → worker picks task → execute
 ```
 
-**Implementation:** [Server.hpp](../include/server/Server.hpp), [ThreadPool.hpp](../include/server/ThreadPool.hpp)
+**Implementation:** [Server.hpp](../src/server/Server.hpp), [ThreadPool.hpp](../src/server/ThreadPool.hpp)
 
 ---
 
-### 2. Handler Module (`include/handlers/`)
+### 2. Handler Module (`src/handlers/`)
 
 **Purpose:**
 > Requests nu handle karo - connection se lekar response tak
@@ -171,26 +173,38 @@ while (keep_alive) {
 ```
 
 #### RouteHandler
-- **Responsibility:** URL routing, business logic
-- **Routes:**
-  | Pattern | Handler | Compression |
-  |---------|---------|-------------|
-  | `GET /` | `handleRoot()` | No |
-  | `GET /echo/{str}` | `handleEcho()` | Yes |
-  | `GET /user-agent` | `handleUserAgent()` | Yes |
-  | `GET /files/{name}` | `handleFileGet()` | Text only |
-  | `POST /files/{name}` | `handleFilePost()` | No |
+- **Responsibility:** thin dispatcher. It holds the `FileHandler` and hands the
+  request to the route table in `handlers/routes/`. It contains no routing
+  logic of its own.
+- **Routes** (the table lives in [route_registry.cpp](../src/handlers/routes/route_registry.cpp)):
 
-**Routing Algorithm:**
+  | Pattern | Handler | File |
+  |---------|---------|------|
+  | `GET /` | `handleRoot()` | `root_route.cpp` |
+  | `GET /echo/{str}` | `handleEcho()` | `echo_route.cpp` |
+  | `GET /user-agent` | `handleUserAgent()` | `user_agent_route.cpp` |
+  | `GET /files/{name...}` | `handleFileGet()` | `files_route.cpp` |
+  | `POST /files/{name...}` | `handleFilePost()` | `files_route.cpp` |
+  | `HEAD` on each of the above | `asHead(<getHandler>)` | `head_adapter.cpp` |
+
+  Compression is no longer a per-route decision. The dispatcher applies the
+  content-coding policy to whatever the handler returned, so a route cannot
+  forget to compress and a new route gets compression for free.
+
+**Routing algorithm:** iterate the table, match the pattern, compare the
+method.
 ```cpp
-if (path == "/") return handleRoot();
-if (startsWith(path, "/echo/")) return handleEcho();
-if (path == "/user-agent") return handleUserAgent();
-if (startsWith(path, "/files/")) {
-    return (method == "GET") ? handleFileGet() : handleFilePost();
+for (const Route& route : routeTable()) {
+    if (!pathMatches(path, route.pathPattern)) continue;
+    pathMatchedSomeRoute = true;
+    if (method == route.method) return route.handler(ctx);
 }
-return notFound();
+return pathMatchedSomeRoute ? methodNotAllowed() : notFound();
 ```
+
+Pattern syntax: `{name}` matches exactly one path segment, `{name...}` is a
+greedy tail that matches the rest. A known path with an unlisted method is
+**405**, not 400; an unknown path is **404**.
 
 #### FileHandler
 - **Responsibility:** File I/O, security
@@ -201,18 +215,21 @@ return notFound();
 
 **Path Safety:**
 ```cpp
-canonical_base = "/var/www/"
-canonical_path = canonicalize(base + requested_path)
+canonical_base = canonical(baseDirectory)
+canonical_path = weakly_canonical(baseDirectory / requested)
 
-if (canonical_path starts with canonical_base) → SAFE
-else → REJECT (path traversal attack!)
+// Compare whole path COMPONENTS, not characters: a character-prefix check
+// would accept "/var/wwwroot" for a base of "/var/www".
+mismatch(base.begin(), base.end(), path.begin(), path.end());
+if (base_iter == base.end()) → SAFE
+else → REJECT (path traversal)
 ```
 
-**Implementation:** [ConnectionHandler.hpp](../include/handlers/ConnectionHandler.hpp), [RouteHandler.hpp](../include/handlers/RouteHandler.hpp), [FileHandler.hpp](../include/handlers/FileHandler.hpp)
+**Implementation:** [ConnectionHandler.hpp](../src/handlers/ConnectionHandler.hpp), [RouteHandler.hpp](../src/handlers/RouteHandler.hpp), [FileHandler.hpp](../src/handlers/FileHandler.hpp)
 
 ---
 
-### 3. HTTP Module (`include/http/`)
+### 3. HTTP Module (`src/http/`)
 
 **Purpose:**
 > HTTP protocol lai - parsing te building
@@ -266,11 +283,11 @@ else → REJECT (path traversal attack!)
   - MIME types
   - Protocol strings
 
-**Implementation:** [HttpRequest.hpp](../include/http/HttpRequest.hpp), [HttpResponse.hpp](../include/http/HttpResponse.hpp), [HttpConstants.hpp](../include/http/HttpConstants.hpp)
+**Implementation:** [HttpRequest.hpp](../src/http/HttpRequest.hpp), [HttpResponse.hpp](../src/http/HttpResponse.hpp), [HttpConstants.hpp](../src/http/HttpConstants.hpp)
 
 ---
 
-### 4. Compression Module (`include/compression/`)
+### 4. Compression Module (`src/compression/`)
 
 **Purpose:**
 > Data compression lai bandwidth bachana
@@ -279,36 +296,50 @@ else → REJECT (path traversal attack!)
 
 **Components:**
 
-#### GzipCompressor
-- **Compression Pipeline:**
-  ```
-  Input data
-      ↓
-  deflateInit2() - Initialize zlib with gzip format
-      ↓
-  deflate() - Compress
-      ↓
-  deflateEnd() - Cleanup
-      ↓
-  Compressed data
-  ```
+Three classes, one per concept. Before the restructure this was a single
+`GzipCompressor` that only ever produced gzip, despite a `deflate` constant
+sitting unused in `HttpConstants`.
+
+| Class | Responsibility |
+|---|---|
+| `ContentEncoding` | the codings we can emit (`Gzip`, `Deflate`, `Identity`) |
+| `ResponseEncoder` | zlib deflate, container chosen by coding |
+| `EncodingNegotiator` | `Accept-Encoding` -> one chosen coding |
+
+**Encoding Pipeline:**
+```
+Negotiation:  Accept-Encoding -> parse -> score each coding -> pick one
+                                                ↓
+Encoder:       deflateInit2(windowBits)  →  deflate(Z_FINISH)  →  deflateEnd()
+                 15 + 16 = gzip container
+                 -15     = raw deflate stream
+```
+
+Both codings are the same DEFLATE algorithm; only the container differs. On a
+400-byte body gzip costs 26 bytes and deflate costs 8 — the 18-byte difference
+is exactly the gzip header and trailer.
 
 **Decision Tree:**
 ```
-Accept-Encoding has "gzip"?
-  ├─No──> Don't compress
-  └─Yes─> Data size > 1KB?
-            ├─No──> Don't compress (overhead > benefit)
-            └─Yes─> Content-Type compressible?
-                      ├─No (image/video)──> Don't compress
-                      └─Yes (text/*)────> COMPRESS!
+Accept-Encoding present?
+  ├─No──> Identity (no compression)
+  └─Yes─> score every coding we can produce:
+            highest q wins;  coding;q=0 is refused
+            on a q tie, the client's list order wins
+            "*" accepts anything we can produce
+              ↓
+          Content-Type already compressed (image/video/audio/zip)?
+            ├─Yes──> Identity
+            └─No───> compress with the chosen coding
 ```
 
-**Implementation:** [GzipCompressor.hpp](../include/compression/GzipCompressor.hpp)
+**Implementation:** [content_encoding.hpp](../src/compression/content_encoding.hpp),
+[response_encoder.hpp](../src/compression/response_encoder.hpp),
+[encoding_negotiator.hpp](../src/compression/encoding_negotiator.hpp)
 
 ---
 
-### 5. Utilities Module (`include/utils/`)
+### 5. Utilities Module (`src/utils/`)
 
 **Purpose:**
 > Cross-cutting concerns - logging, string operations
@@ -337,7 +368,7 @@ Accept-Encoding has "gzip"?
   - `equalsIgnoreCase()` - Case-insensitive compare
   - `urlDecode()` - URL decoding
 
-**Implementation:** [Logger.hpp](../include/utils/Logger.hpp), [StringUtils.hpp](../include/utils/StringUtils.hpp)
+**Implementation:** [Logger.hpp](../src/utils/Logger.hpp), [StringUtils.hpp](../src/utils/StringUtils.hpp)
 
 ---
 
@@ -490,7 +521,7 @@ condition.notify_one();                    // SIGNAL
 task();                                          // EXECUTE (outside lock!)
 ```
 
-**Implementation:** [ThreadPool.hpp](../include/server/ThreadPool.hpp)
+**Implementation:** [ThreadPool.hpp](../src/server/ThreadPool.hpp)
 
 ---
 
@@ -583,30 +614,38 @@ HttpResponse handleRequest(HttpRequest& req) {
     // Common pre-processing
     log(req);
     
-    // Route-specific logic
-    HttpResponse res = routeSpecificHandler(req);
+    // Route-specific logic - the matched table row
+    HttpResponse res = matchedRoute.handler(ctx);
     
-    // Common post-processing
-    applyCompression(res, req);
+    // Common post-processing - owned here, not by each route (Rule 8)
+    applyContentEncoding(res, req);
     
     return res;
 }
 ```
 
-### 4. Strategy Pattern
-**Used in:** Compression
+### 4. Registry / Table-Driven Dispatch
+**Used in:** Routing, and content-coding selection
 
-**Purpose:** Different compression strategies (gzip, deflate, none)
+**Purpose:** Add a route or a content coding as one row of data, not as a new
+branch in a growing if/else.
 
-**Example:**
+**Routing example** — the entire mechanism, from `routes/route_registry.cpp`:
 ```cpp
-if (supportsGzip(acceptEncoding)) {
-    strategy = GzipCompressor::compress;
-} else if (supportsDeflate(acceptEncoding)) {
-    strategy = DeflateCompressor::compress;
-} else {
-    strategy = identity;  // No compression
-}
+const std::vector<Route> kRouteTable = {
+    {METHOD_GET,  "/",                &handleRoot},
+    {METHOD_GET,  "/echo/{str}",      &handleEcho},
+    {METHOD_GET,  "/files/{name...}", &handleFileGet},
+    {METHOD_POST, "/files/{name...}", &handleFilePost},
+    {METHOD_HEAD, "/",                asHead(&handleRoot)},
+    // ...
+};
+```
+
+**Content-coding example** — same idea, applied to `Accept-Encoding`:
+```cpp
+// The candidate set is data, so adding a coding needs no new control flow.
+constexpr ContentEncoding kOffered[] = {ContentEncoding::Gzip, ContentEncoding::Deflate};
 ```
 
 ### 5. Producer-Consumer Pattern
