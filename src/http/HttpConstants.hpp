@@ -82,6 +82,10 @@ public:
     static constexpr const char* CONNECTION_CLOSE = "close";
 
     // ==================== Encoding Values ====================
+    // NOTE: the literals the server actually emits live in
+    // compression::toHeaderValue() (src/compression/content_encoding.hpp).
+    // These constants are kept as the protocol-level vocabulary; prefer the
+    // compression layer in new code so the two cannot drift apart.
     static constexpr const char* ENCODING_GZIP = "gzip";
     static constexpr const char* ENCODING_DEFLATE = "deflate";
     static constexpr const char* ENCODING_IDENTITY = "identity";

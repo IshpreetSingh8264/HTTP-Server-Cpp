@@ -240,9 +240,12 @@ curl -I localhost:4221/health          # 200, headers only
   CodeCrafters builds and runs the program. `your_program.sh` mirrors them for
   local use; if you change one, change both.
 - **`codecrafters.yml`** — `buildpack: cpp-23` is what selects the compiler.
-- **`src/http/HttpConstants.hpp`** — the vocabulary. Add codes as
-  `constexpr`; do not scatter string literals like `"deflate"` through the
-  handlers. That is what `content_encoding` exists to prevent.
+- **`src/http/HttpConstants.hpp`** — the protocol vocabulary. Add status codes
+  and methods as `constexpr` here. But do **not** hand-write encoding strings
+  like `"deflate"` at a call site: use `compression::toHeaderValue(coding)`.
+  The `ENCODING_*` constants are kept for reference and are deliberately
+  unused, so the compression layer is the single source of truth for what goes
+  on the wire.
 
 ## 8. Known limitations
 
