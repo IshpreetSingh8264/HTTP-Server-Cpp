@@ -110,8 +110,24 @@ void HttpRequest::parseHeaderLine(const std::string& line) {
         return;
     }
 
-    std::string name = utils::StringUtils::trim(line.substr(0, colonPos));
-    std::string value = utils::StringUtils::trim(line.substr(colonPos + 1));
+    const std::string name = utils::StringUtils::trim(line.substr(0, colonPos));
+    const std::string value = utils::StringUtils::trim(line.substr(colonPos + 1));
+
+    if (name.empty()) {
+        utils::Logger::warn("Header name khali hai! Skip kar ditte: " + line);
+        return;
+    }
+
+    // A field may legitimately arrive more than once. List-valued fields such
+    // as Accept-Encoding are then the comma-joined union of every occurrence,
+    // not a last-one-wins overwrite - otherwise
+    //   curl -H 'Accept-Encoding: deflate' -H 'Accept-Encoding: gzip'
+    // would silently lose the deflate offer.
+    auto existing = headers_.find(name);
+    if (existing != headers_.end()) {
+        existing->second += ", " + value;
+        return;
+    }
 
     headers_[name] = value;
 }

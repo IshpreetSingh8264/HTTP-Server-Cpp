@@ -11,7 +11,8 @@
 
 #include "handlers/routes/head_adapter.hpp"
 #include "handlers/routes/route_handlers.hpp"
-#include "compression/GzipCompressor.hpp"
+#include "compression/encoding_negotiator.hpp"
+#include "compression/response_encoder.hpp"
 #include "http/HttpConstants.hpp"
 #include "utils/Logger.hpp"
 #include "utils/StringUtils.hpp"
@@ -110,7 +111,7 @@ bool pathMatches(const std::string& path, const std::string& pattern) {
 namespace {
 
 /**
- * Apply the shared response-compression policy.
+ * Apply the shared content-coding policy.
  *
  * This lives in the dispatcher rather than in each route on purpose: whether a
  * body may be compressed depends on the request and on the response, not on
@@ -120,10 +121,10 @@ void applyContentEncoding(http::HttpResponse& response, const http::HttpRequest&
     const std::string acceptEncoding =
         request.getHeader(http::HttpConstants::HEADER_ACCEPT_ENCODING);
 
-    if (acceptEncoding.empty()) {
-        return;
-    }
-    if (!compression::GzipCompressor::supportsGzip(acceptEncoding)) {
+    const compression::ContentEncoding encoding =
+        compression::EncodingNegotiator::negotiate(acceptEncoding);
+
+    if (encoding == compression::ContentEncoding::Identity) {
         return;
     }
 
@@ -133,18 +134,22 @@ void applyContentEncoding(http::HttpResponse& response, const http::HttpRequest&
         contentType = http::HttpConstants::MIME_TEXT_PLAIN;
     }
 
-    if (!compression::GzipCompressor::shouldCompress(response.getBody(), contentType)) {
+    if (!compression::ResponseEncoder::shouldCompress(response.getBody(), contentType)) {
         return;
     }
 
     const std::vector<char> compressed =
-        compression::GzipCompressor::compress(response.getBody());
+        compression::ResponseEncoder::compress(response.getBody(), encoding);
 
-    if (!compressed.empty()) {
-        response.setCompressedBody(compressed, http::HttpConstants::ENCODING_GZIP);
-        utils::Logger::debug("Response gzip compressed: " + std::to_string(compressed.size()) +
-                             " bytes");
+    if (compressed.empty()) {
+        // Never fail the request over compression: fall back to identity.
+        return;
     }
+
+    response.setCompressedBody(compressed, compression::toHeaderValue(encoding));
+    utils::Logger::debug(std::string("Response ") + compression::toHeaderValue(encoding) +
+                         ": " + std::to_string(response.getBody().size()) + " -> " +
+                         std::to_string(compressed.size()) + " bytes");
 }
 
 } // namespace

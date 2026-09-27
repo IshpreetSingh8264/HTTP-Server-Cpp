@@ -34,6 +34,8 @@ private:
     bool valid_;                                                 // Parse successful?
 
     bool parseRequestLine(const std::string& line);
+
+    /// Parse one "Name: value" line. Repeated fields are comma-joined.
     void parseHeaderLine(const std::string& line);
 
 public:
