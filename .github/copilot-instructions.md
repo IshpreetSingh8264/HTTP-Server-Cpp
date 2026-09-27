@@ -253,3 +253,35 @@ Not on the course, deliberately absent: TLS, Range requests / 206,
 multipart/form-data. `Transfer-Encoding: chunked` is likewise unsupported —
 requests must use `Content-Length`. A zero-byte file under `/files/` returns
 500, because `readFile()` cannot distinguish an empty file from a failed read.
+
+## 9. Testing
+
+From a clean checkout, one command, 150 assertions, no network:
+
+```sh
+./tests/run.sh                  # 73 unit + 77 behavioural
+./tests/run.sh unit             # just the C++ unit binaries
+./tests/run.sh integration      # just the socket-level behaviour suite
+ctest --test-dir build          # same suites, via CTest
+```
+
+The integration suite binds port 4221, which the server hardcodes and cannot be
+moved. It **refuses to run** if that port is already busy rather than sharing
+it with a stale server — if you see that message, `ss -tlnp | grep 4221`.
+
+What each suite covers, and — more usefully — what it deliberately does not,
+is in `tests/README.md`. Read it before trusting a green run. The two gaps
+worth knowing about: response-header *values* other than `Content-Length` and
+`Content-Encoding` are not asserted, and the 500 on a zero-byte file is a known
+limitation that the suite deliberately does not pin down.
+
+Two behaviours these suites exist to protect, both of which have broken before:
+
+- **Pipelining with a body larger than the read buffer.** The old read loop
+  appended whole 8192-byte reads, so a 20 KB body swallowed the request behind
+  it. `test_pipelining.py` sends both in a single `write()` and requires two
+  clean responses.
+- **deflate must be a raw stream.** `test_compression.py` inflates every
+  compressed body back with `zlib` and compares it to the original file, using
+  `-MAX_WBITS` for deflate and `16+MAX_WBITS` for gzip. A correct
+  `Content-Encoding` header over a broken body is still broken.
